@@ -1,0 +1,107 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  account      String   @unique
+  passwordHash String
+  username     String   @unique
+  role         String   @default("user")
+  points       Int      @default(5)
+  taskBlocked  Boolean  @default(false)
+  avatarType   String   @default("default")
+  avatarValue  String?
+  pointLogs         PointLog[] @relation("PointLogOwner")
+  operatedPointLogs PointLog[] @relation("PointLogOperator")
+  userState         UserState?
+  paymentOrders     PaymentOrder[]
+  taskRecords       TaskRecord[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model PointLog {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation("PointLogOwner", fields: [userId], references: [id], onDelete: Cascade)
+  delta        Int
+  reason       String
+  relatedId    String?
+  operatorId   String?
+  operator     User?    @relation("PointLogOperator", fields: [operatorId], references: [id], onDelete: SetNull)
+  balanceAfter Int
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model UserState {
+  userId      String   @id
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  historyJson String   @default("[]")
+  queueJson   String   @default("[]")
+  updatedAt   DateTime @updatedAt
+}
+
+model PaymentOrder {
+  id            String   @id @default(cuid())
+  orderNo       String   @unique
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel       String
+  amountFen     Int
+  points        Int
+  status        String   @default("pending")
+  clientOrderNo String?
+  thirdTradeNo  String?
+  paidAt        DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId, createdAt])
+}
+
+model TaskRecord {
+  id           String   @id
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestId    String
+  workflowId   String
+  workflowTitle String
+  status       String
+  taskId       String?
+  pointsCost   Int      @default(0)
+  resultUrl    String?
+  resultType   String?
+  error        String?
+  payloadJson  String?
+  deliveryStatus      String   @default("none")
+  deliveryAttempts    Int      @default(0)
+  deliveryMaxAttempts Int      @default(5)
+  deliveryLastError   String?
+  deliveryNextRetryAt DateTime?
+  deliveryAckAt       DateTime?
+  hiddenAt            DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  startedAt    DateTime?
+  finishedAt   DateTime?
+
+  @@index([userId, status, createdAt])
+  @@index([requestId])
+  @@unique([userId, requestId])
+  @@index([status, deliveryStatus, deliveryNextRetryAt])
+  @@index([userId, hiddenAt, createdAt])
+}
