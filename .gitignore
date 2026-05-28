@@ -32,10 +32,13 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env*.example
 
 # prisma sqlite
 prisma/dev.db
 prisma/dev.db-journal
+prisma/**/*.db
+prisma/**/*.db-journal
 
 # vercel
 .vercel

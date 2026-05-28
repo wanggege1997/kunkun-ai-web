@@ -15,10 +15,20 @@ export async function POST(request: Request) {
   }
 
   try {
-    const record = await cancelQueuedTaskById(user.id, id);
-    return NextResponse.json({ success: true, data: { id: record.id, pointsCost: record.pointsCost } });
+    const result = await cancelQueuedTaskById(user.id, id);
+    return NextResponse.json({
+      success: true,
+      data: {
+        id: result.record.id,
+        pointsCost: result.record.pointsCost,
+        refunded: result.refunded,
+        pointsDelta: result.pointsDelta,
+        chargedPoints: result.chargedPoints,
+      },
+    });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : '取消失败';
-    return NextResponse.json({ success: false, message }, { status: 400 });
+    const status = message.includes('已完成生成') ? 409 : 400;
+    return NextResponse.json({ success: false, message }, { status });
   }
 }

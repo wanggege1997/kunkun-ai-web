@@ -1,10 +1,10 @@
 import { SignJWT, jwtVerify } from "jose";
 import { NextResponse } from "next/server";
 
-const ACCOUNT_RE = /^\d{10}$/;
-const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,10}$/;
+const ACCOUNT_RE = /^\d{8,12}$/;
+const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,20}$/;
 const USERNAME_RE = /^[A-Za-z0-9_\u4e00-\u9fa5]{1,12}$/;
-const SESSION_COOKIE_NAME = "session";
+const SESSION_COOKIE_NAME = "kunkun_session";
 
 function getSecret() {
   const value =
@@ -21,6 +21,10 @@ export function validateAccount(value: string) {
 }
 
 export function validatePassword(value: string) {
+  return PASSWORD_RE.test(value);
+}
+
+export function validatePasswordLogin(value: string) {
   return PASSWORD_RE.test(value);
 }
 
@@ -56,6 +60,7 @@ export function setSessionCookie(response: NextResponse, token: string) {
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
     path: "/",
+    maxAge: 60 * 60 * 24 * 7,
   });
 }
 

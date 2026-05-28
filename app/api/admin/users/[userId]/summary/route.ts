@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSessionUserFromRequest, isAdminUser } from '@/lib/server-auth';
+import { getUserSecurityEvents } from '@/lib/risk-control';
 
 export async function GET(
   request: Request,
@@ -12,7 +13,7 @@ export async function GET(
   }
 
   const { userId } = await context.params;
-  const [user, pointLogs, orders] = await Promise.all([
+  const [user, pointLogs, orders, securityEvents] = await Promise.all([
     prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -55,6 +56,7 @@ export async function GET(
         createdAt: true,
       },
     }),
+    getUserSecurityEvents(userId, 20),
   ]);
 
   if (!user) {
@@ -67,6 +69,7 @@ export async function GET(
       user,
       pointLogs,
       orders,
+      securityEvents,
     },
   });
 }

@@ -1,0 +1,15 @@
+{
+  "buildCommand": "prisma generate && next build",
+  "functions": {
+    "app/api/**/*.ts": {
+      "maxDuration": 60
+    }
+  },
+  "env": {
+    "DATABASE_URL": "@database_url",
+    "JWT_SECRET": "@jwt_secret",
+    "RUNNINGHUB_API_KEY": "@runninghub_api_key",
+    "INTERNAL_WORKER_SECRET": "@internal_worker_secret",
+    "INTERNAL_BASE_URL": "@internal_base_url"
+  }
+}

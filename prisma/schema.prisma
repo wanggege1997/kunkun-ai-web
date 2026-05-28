@@ -3,40 +3,44 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
 model User {
-  id           String   @id @default(cuid())
-  account      String   @unique
-  passwordHash String
-  username     String   @unique
-  role         String   @default("user")
-  points       Int      @default(5)
-  taskBlocked  Boolean  @default(false)
-  avatarType   String   @default("default")
-  avatarValue  String?
-  pointLogs         PointLog[] @relation("PointLogOwner")
-  operatedPointLogs PointLog[] @relation("PointLogOperator")
-  userState         UserState?
+  id                String         @id @default(cuid())
+  account           String         @unique
+  passwordHash      String
+  username          String         @unique
+  role              String         @default("user")
+  points            Int            @default(5)
+  taskBlocked       Boolean        @default(false)
+  avatarType        String         @default("default")
+  avatarValue       String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
   paymentOrders     PaymentOrder[]
+  operatedPointLogs PointLog[]     @relation("PointLogOperator")
+  pointLogs         PointLog[]     @relation("PointLogOwner")
   taskRecords       TaskRecord[]
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  userState         UserState?
+  createdRedeemCodes RedeemCode[]  @relation("RedeemCodeCreator")
+  boundRedeemCodes   RedeemCode[]  @relation("RedeemCodeBoundUser")
+  usedRedeemCodes    RedeemCode[]  @relation("RedeemCodeUsedByUser")
+  redeemCodeUseLogs  RedeemCodeUseLog[]
 }
 
 model PointLog {
   id           String   @id @default(cuid())
   userId       String
-  user         User     @relation("PointLogOwner", fields: [userId], references: [id], onDelete: Cascade)
   delta        Int
   reason       String
   relatedId    String?
   operatorId   String?
-  operator     User?    @relation("PointLogOperator", fields: [operatorId], references: [id], onDelete: SetNull)
   balanceAfter Int
   createdAt    DateTime @default(now())
+  operator     User?    @relation("PointLogOperator", fields: [operatorId], references: [id])
+  user         User     @relation("PointLogOwner", fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
 }
@@ -49,59 +53,112 @@ model SystemSetting {
 
 model UserState {
   userId      String   @id
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   historyJson String   @default("[]")
   queueJson   String   @default("[]")
   updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model PaymentOrder {
-  id            String   @id @default(cuid())
-  orderNo       String   @unique
+  id            String    @id @default(cuid())
+  orderNo       String    @unique
   userId        String
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   channel       String
   amountFen     Int
   points        Int
-  status        String   @default("pending")
+  status        String    @default("pending")
   clientOrderNo String?
   thirdTradeNo  String?
   paidAt        DateTime?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
 }
 
 model TaskRecord {
-  id           String   @id
-  userId       String
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  requestId    String
-  workflowId   String
-  workflowTitle String
-  status       String
-  taskId       String?
-  pointsCost   Int      @default(0)
-  resultUrl    String?
-  resultType   String?
-  error        String?
-  payloadJson  String?
-  deliveryStatus      String   @default("none")
-  deliveryAttempts    Int      @default(0)
-  deliveryMaxAttempts Int      @default(5)
+  id                  String    @id
+  userId              String
+  requestId           String
+  workflowId          String
+  workflowTitle       String
+  status              String
+  taskId              String?
+  pointsCost          Int       @default(0)
+  resultUrl           String?
+  resultType          String?
+  error               String?
+  payloadJson         String?
+  deliveryStatus      String    @default("none")
+  deliveryAttempts    Int       @default(0)
+  deliveryMaxAttempts Int       @default(5)
   deliveryLastError   String?
   deliveryNextRetryAt DateTime?
   deliveryAckAt       DateTime?
   hiddenAt            DateTime?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  startedAt    DateTime?
-  finishedAt   DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  startedAt           DateTime?
+  finishedAt          DateTime?
+  pointCapturedAt     DateTime?
+  pointReleasedAt     DateTime?
+  pointReservedAt     DateTime?
+  pointState          String    @default("none")
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, requestId])
   @@index([userId, status, createdAt])
   @@index([requestId])
-  @@unique([userId, requestId])
   @@index([status, deliveryStatus, deliveryNextRetryAt])
   @@index([userId, hiddenAt, createdAt])
+  @@index([pointState, status, updatedAt])
+}
+
+model RedeemCode {
+  id              String              @id @default(cuid())
+  codeHash        String              @unique
+  codePreview     String
+  mode            String              @default("universal")
+  points          Int
+  amountFen       Int?
+  exchangeRate    Int                 @default(100)
+  maxUses         Int                 @default(1)
+  usedCount       Int                 @default(0)
+  status          String              @default("active")
+  expiresAt       DateTime?
+  usedAt          DateTime?
+  note            String?
+  boundUserId     String?
+  usedByUserId    String?
+  createdByUserId String
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  boundUser       User?               @relation("RedeemCodeBoundUser", fields: [boundUserId], references: [id], onDelete: SetNull)
+  usedByUser      User?               @relation("RedeemCodeUsedByUser", fields: [usedByUserId], references: [id], onDelete: SetNull)
+  createdByUser   User                @relation("RedeemCodeCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  useLogs         RedeemCodeUseLog[]
+
+  @@index([status, expiresAt])
+  @@index([mode, status])
+  @@index([boundUserId])
+  @@index([usedByUserId])
+  @@index([createdByUserId])
+  @@index([createdAt])
+}
+
+model RedeemCodeUseLog {
+  id           String     @id @default(cuid())
+  redeemCodeId String
+  userId       String
+  points       Int
+  requestIp    String?
+  userAgent    String?
+  createdAt    DateTime   @default(now())
+  redeemCode   RedeemCode @relation(fields: [redeemCodeId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([redeemCodeId, userId])
+  @@index([userId, createdAt])
+  @@index([redeemCodeId, createdAt])
 }

@@ -3,10 +3,55 @@ import { prisma } from '@/lib/prisma';
 import { getSessionUserFromRequest } from '@/lib/server-auth';
 import { createOrderNo } from '@/lib/payment';
 
+const ORDER_REUSE_WINDOW_MS = 5 * 60 * 1000;
+const ORDER_CREATE_LIMIT_WINDOW_MS = 60 * 1000;
+const ORDER_CREATE_LIMIT_COUNT = 3;
+
+async function pruneOverflowPendingOrders(userId: string, keep = 5) {
+  const pendingOrders = await prisma.paymentOrder.findMany({
+    where: {
+      userId,
+      status: 'pending',
+    },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true },
+  });
+
+  if (pendingOrders.length <= keep) return;
+
+  const overflowIds = pendingOrders.slice(keep).map((item) => item.id);
+  if (overflowIds.length === 0) return;
+
+  await prisma.paymentOrder.updateMany({
+    where: {
+      id: { in: overflowIds },
+      status: 'pending',
+    },
+    data: {
+      status: 'closed',
+      clientOrderNo: 'closed:auto_prune_overflow_pending',
+    },
+  });
+}
+
 export async function POST(request: Request) {
   const user = await getSessionUserFromRequest(request);
   if (!user) {
     return NextResponse.json({ success: false, message: '未登录' }, { status: 401 });
+  }
+
+  const rateWindowStart = new Date(Date.now() - ORDER_CREATE_LIMIT_WINDOW_MS);
+  const recentCreateCount = await prisma.paymentOrder.count({
+    where: {
+      userId: user.id,
+      createdAt: { gte: rateWindowStart },
+    },
+  });
+  if (recentCreateCount >= ORDER_CREATE_LIMIT_COUNT) {
+    return NextResponse.json(
+      { success: false, message: '操作过于频繁，请一分钟后再试' },
+      { status: 429 }
+    );
   }
 
   const body = await request.json().catch(() => ({}));
@@ -23,6 +68,39 @@ export async function POST(request: Request) {
   }
   if (!Number.isInteger(points) || points <= 0) {
     return NextResponse.json({ success: false, message: '积分数量不合法' }, { status: 400 });
+  }
+
+  const reuseAfter = new Date(Date.now() - ORDER_REUSE_WINDOW_MS);
+  const reusableOrder = await prisma.paymentOrder.findFirst({
+    where: {
+      userId: user.id,
+      channel,
+      amountFen,
+      points,
+      status: 'pending',
+      createdAt: { gte: reuseAfter },
+    },
+    orderBy: { createdAt: 'desc' },
+    select: {
+      orderNo: true,
+      channel: true,
+      amountFen: true,
+      points: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+
+  if (reusableOrder) {
+    await pruneOverflowPendingOrders(user.id, 5);
+    return NextResponse.json({
+      success: true,
+      data: {
+        ...reusableOrder,
+        reused: true,
+        payUrl: `/pay/${reusableOrder.orderNo}`,
+      },
+    });
   }
 
   const orderNo = createOrderNo('PO');
@@ -46,11 +124,14 @@ export async function POST(request: Request) {
     },
   });
 
+  await pruneOverflowPendingOrders(user.id, 5);
+
   return NextResponse.json({
     success: true,
     data: {
       ...order,
-      payUrl: `/pay/mock/${order.orderNo}`,
+      reused: false,
+      payUrl: `/pay/${order.orderNo}`,
     },
   });
 }

@@ -2,7 +2,7 @@
 'use client';
 /* eslint-disable @next/next/no-img-element */
 
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent } from 'react';
 import Link from 'next/link';
 import {
   Home,
@@ -26,11 +26,13 @@ import {
 } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { workflows, Workflow, getWorkflowPointCostById } from '@/lib/workflows';
+import { useUserBalance, setUserBalance, setUserAuthState, refreshUserBalance } from '@/lib/user-balance-store';
 
 type TaskStatus = 'submitting' | 'queueing' | 'running' | 'success' | 'failed' | 'timeout' | 'cancelled';
 type DeliveryStatus = 'none' | 'pending' | 'retrying' | 'delivered' | 'failed';
-type ActiveView = 'workflows' | 'history' | 'recharge';
-type RechargeTab = 'user' | 'points' | 'referral' | 'help';
+type ActiveView = 'workflows' | 'history' | 'recharge' | 'referral' | 'help';
+type RechargeTab = 'user' | 'points';
+type RechargeChannel = 'wechat' | 'alipay';
 type MediaType = 'image' | 'video' | 'audio' | 'unknown';
 type HistoryRecordFilter = 'all' | 'success' | 'failed' | 'image' | 'video' | 'audio';
 
@@ -77,6 +79,12 @@ type PointLedgerItem = {
   createdAt: number;
 };
 
+type ValidationRule = {
+  label: string;
+  valid: boolean;
+  submitMessage?: string;
+};
+
 type AuthUser = {
   id: string;
   account: string;
@@ -86,6 +94,13 @@ type AuthUser = {
   taskBlocked: boolean;
   avatarType?: 'default' | 'upload';
   avatarValue?: string | null;
+};
+
+type DisabledWorkflowStatus = {
+  workflowId: string;
+  disabled: boolean;
+  reason?: string;
+  disabledAt?: string;
 };
 
 const DEFAULT_AVATAR_OPTIONS = [
@@ -119,6 +134,19 @@ type QueuePauseReason =
   | 'task_failed'
   | 'task_timeout'
   | 'missing_output';
+
+type PendingPayOrder = {
+  orderNo: string;
+  channel: 'wechat' | 'alipay';
+  amountFen: number;
+  points: number;
+  status: string;
+  createdAt: string;
+  expireAt: string;
+  remainingSeconds: number;
+};
+
+const LOCAL_QUEUE_OPTIMISTIC_TTL_MS = 20_000;
 
 function isTerminalHistoryStatus(status: TaskStatus) {
   return status === 'success' || status === 'failed' || status === 'timeout' || status === 'cancelled';
@@ -220,8 +248,21 @@ const HISTORY_TTL_MS = 15 * 24 * 60 * 60 * 1000;
 const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const POINT_LEDGER_TTL_MS = 15 * 24 * 60 * 60 * 1000;
 const SERVER_QUEUE_EXECUTOR_ENABLED = true;
-const ACCOUNT_RE = /^\d{10}$/;
-const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,10}$/;
+const ACCOUNT_RE = /^\d{8,12}$/;
+
+function buildPasswordPolicyRules(value: string, submitFieldName: string): ValidationRule[] {
+  const lengthValid = value.length >= 8 && value.length <= 20;
+  const letterValid = /[A-Za-z]/.test(value);
+  const numberValid = /\d/.test(value);
+  const charsetValid = /^[A-Za-z\d]*$/.test(value);
+
+  return [
+    { label: '长度需在8-20位之间', valid: lengthValid, submitMessage: `${submitFieldName}长度需在8-20位之间` },
+    { label: '至少包含1个字母', valid: letterValid, submitMessage: `${submitFieldName}需至少包含1个字母` },
+    { label: '至少包含1个数字', valid: numberValid, submitMessage: `${submitFieldName}需至少包含1个数字` },
+    { label: '仅支持字母和数字', valid: charsetValid, submitMessage: `${submitFieldName}仅支持字母和数字` },
+  ];
+}
 
 type QueueProcessorLock = {
   owner: string;
@@ -466,6 +507,23 @@ function createZipBlob(entries: Array<{ name: string; data: Uint8Array }>) {
   return new Blob([zipBytes], { type: 'application/zip' });
 }
 
+function buildPageNumbers(current: number, total: number): Array<number | 'ellipsis'> {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+
+  const pages: Array<number | 'ellipsis'> = [1];
+  const start = Math.max(2, current - 1);
+  const end = Math.min(total - 1, current + 1);
+
+  if (start > 2) pages.push('ellipsis');
+  for (let page = start; page <= end; page += 1) pages.push(page);
+  if (end < total - 1) pages.push('ellipsis');
+
+  pages.push(total);
+  return pages;
+}
+
 export default function DundunPro() {
   const [activeView, setActiveView] = useState<ActiveView>('workflows');
   const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
@@ -485,9 +543,14 @@ export default function DundunPro() {
   const [rechargeRecordsHydrated, setRechargeRecordsHydrated] = useState(false);
   const [pointLedgerHydrated, setPointLedgerHydrated] = useState(false);
   const [queuePanelExpanded, setQueuePanelExpanded] = useState(false);
+  const [queueCancellingIds, setQueueCancellingIds] = useState<Set<string>>(new Set());
+  const [queueCancelLockedIds, setQueueCancelLockedIds] = useState<Set<string>>(new Set());
   const [queuePausedReason, setQueuePausedReason] = useState<QueuePauseReason | null>(null);
   const [workflowCenterLocked, setWorkflowCenterLocked] = useState(false);
-  const [showAllUsageInProfile, setShowAllUsageInProfile] = useState(false);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPageSize, setHistoryPageSize] = useState(20);
+  const [usagePage, setUsagePage] = useState(1);
+  const [usagePageSize, setUsagePageSize] = useState(20);
   const [selectedHistoryIds, setSelectedHistoryIds] = useState<string[]>([]);
   const [exportingHistory, setExportingHistory] = useState(false);
   const [previewZoom, setPreviewZoom] = useState(1);
@@ -496,29 +559,40 @@ export default function DundunPro() {
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [imageLightboxOpen, setImageLightboxOpen] = useState(false);
   const [showAdvisorModal, setShowAdvisorModal] = useState(false);
+  const [advisorPosition, setAdvisorPosition] = useState<{ x: number; y: number } | null>(null);
+  const [isDraggingAdvisor, setIsDraggingAdvisor] = useState(false);
   const [navigatingSlug, setNavigatingSlug] = useState<string | null>(null);
-  const [balance, setBalance] = useState(5);
-  const [balanceHydrated, setBalanceHydrated] = useState(false);
+  const [workflowPrechargePointsMap, setWorkflowPrechargePointsMap] = useState<Record<string, number>>({});
   const [selectedWorkflowTag, setSelectedWorkflowTag] = useState('全部');
   const [workflowKeyword, setWorkflowKeyword] = useState('');
-  const [rechargeRecords, setRechargeRecords] = useState<Array<{ id: string; points: number; amount: number; createdAt: number }>>([]);
+  const [disabledWorkflowMap, setDisabledWorkflowMap] = useState<Record<string, DisabledWorkflowStatus>>({});
+  const [rechargeRecords, setRechargeRecords] = useState<Array<{ id: string; codePreview: string; points: number; createdAt: number }>>([]);
   const [pointLedger, setPointLedger] = useState<PointLedgerItem[]>([]);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authAccount, setAuthAccount] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authPasswordConfirm, setAuthPasswordConfirm] = useState('');
+  const [showAuthPassword, setShowAuthPassword] = useState(false);
+  const [showAuthPasswordConfirm, setShowAuthPasswordConfirm] = useState(false);
+  const [showPasswordCurrent, setShowPasswordCurrent] = useState(false);
+  const [showPasswordNext, setShowPasswordNext] = useState(false);
+  const [showPasswordConfirm, setShowPasswordConfirm] = useState(false);
   const [authError, setAuthError] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [sessionExpiredNotice, setSessionExpiredNotice] = useState('');
+  const [siteNoticeText, setSiteNoticeText] = useState('平台功能持续升级中，如遇问题请联系顾问');
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
   const [rechargeTab, setRechargeTab] = useState<RechargeTab>('user');
-  const [selectedRechargeAmount, setSelectedRechargeAmount] = useState<number | null>(null);
-  const [customRechargeAmount, setCustomRechargeAmount] = useState('');
-  const [showPaymentModal, setShowPaymentModal] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState<'wechat' | 'alipay'>('wechat');
-  const [pendingRechargeAmount, setPendingRechargeAmount] = useState<number | null>(null);
+  const [redeemCodeInput, setRedeemCodeInput] = useState('');
+  const [redeemSubmitting, setRedeemSubmitting] = useState(false);
+  const [pendingPayOrders, setPendingPayOrders] = useState<PendingPayOrder[]>([]);
+  const [pendingPayTick, setPendingPayTick] = useState<number>(Date.now());
+  const [closingPendingPayOrder, setClosingPendingPayOrder] = useState(false);
+  const [rechargeAmountInput, setRechargeAmountInput] = useState('');
+  const [selectedRechargePreset, setSelectedRechargePreset] = useState<number | null>(null);
+  const [rechargeChannel, setRechargeChannel] = useState<RechargeChannel>('wechat');
+  const [rechargeCooldownSeconds, setRechargeCooldownSeconds] = useState(0);
   const [profileUsername, setProfileUsername] = useState('');
   const [profileSubmitting, setProfileSubmitting] = useState(false);
   const [showAvatarModal, setShowAvatarModal] = useState(false);
@@ -543,10 +617,14 @@ export default function DundunPro() {
   const queueProcessorIdRef = useRef(`proc-${Math.random().toString(36).slice(2, 10)}`);
   const queueLockHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previewContainerRef = useRef<HTMLDivElement | null>(null);
+  const advisorButtonRef = useRef<HTMLButtonElement | null>(null);
   const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
   const userMenuRef = useRef<HTMLDivElement | null>(null);
   const enqueueRetryRequestIdRef = useRef<Map<string, { requestId: string; expiresAt: number }>>(new Map());
-  const session401CountRef = useRef(0);
+  const advisorPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const advisorDragStartRef = useRef({ x: 0, y: 0, offsetX: 0, offsetY: 0 });
+  const advisorLongPressActiveRef = useRef(false);
+  const advisorSuppressClickRef = useRef(false);
 
   const currentWorkflowIsAudio = useMemo(
     () => !!selectedWorkflow?.inputs.some((i) => i.type === 'audio'),
@@ -554,6 +632,141 @@ export default function DundunPro() {
   );
   const authUserId = authUser?.id;
   const authUserPoints = authUser?.points;
+  const userBalanceState = useUserBalance();
+  const balance = userBalanceState.balance ?? 0;
+  const balanceHydrated = userBalanceState.ready;
+
+  const getWorkflowDisableMeta = useCallback((workflowId: string) => {
+    return disabledWorkflowMap[workflowId] || null;
+  }, [disabledWorkflowMap]);
+
+  const mergeServerQueueWithLocal = useCallback((serverQueue: QueueTask[], localQueue: QueueTask[]) => {
+    if (localQueue.length === 0) return serverQueue;
+
+    const now = Date.now();
+    const serverHistoryIds = new Set(
+      serverQueue
+        .map((item) => item.historyId)
+        .filter((id): id is string => Boolean(id))
+    );
+    const serverRequestIds = new Set(
+      serverQueue
+        .map((item) => item.requestId)
+        .filter((id): id is string => Boolean(id))
+    );
+
+    const optimisticLocal = localQueue.filter((item) => {
+      if (now - item.createdAt > LOCAL_QUEUE_OPTIMISTIC_TTL_MS) return false;
+      if (item.historyId && serverHistoryIds.has(item.historyId)) return false;
+      if (item.requestId && serverRequestIds.has(item.requestId)) return false;
+      return true;
+    });
+
+    if (optimisticLocal.length === 0) return serverQueue;
+
+    return [...serverQueue, ...optimisticLocal].sort((a, b) => {
+      if (a.state === 'running' && b.state !== 'running') return -1;
+      if (a.state !== 'running' && b.state === 'running') return 1;
+      return a.createdAt - b.createdAt;
+    });
+  }, []);
+
+  const fetchSiteNotice = useCallback(async () => {
+    try {
+      const response = await fetch('/api/system/notice', { cache: 'no-store' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.success) return;
+      const text = String(data?.data?.text || '').trim();
+      if (text) setSiteNoticeText(text);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchSiteNotice();
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void fetchSiteNotice();
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [fetchSiteNotice]);
+
+  const getEffectiveWorkflowPointCost = useCallback((workflowId: string) => {
+    const syncedPoints = workflowPrechargePointsMap[workflowId];
+    if (typeof syncedPoints === 'number' && Number.isFinite(syncedPoints) && syncedPoints >= 0) {
+      return Math.floor(syncedPoints);
+    }
+    return getWorkflowPointCostById(workflowId);
+  }, [workflowPrechargePointsMap]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const response = await fetch('/api/workflow-precharge-points', { cache: 'no-store' });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success) return;
+        const source = data?.data?.pointsMap;
+        if (!source || typeof source !== 'object') {
+          setWorkflowPrechargePointsMap({});
+          return;
+        }
+        const nextMap: Record<string, number> = {};
+        for (const [workflowId, value] of Object.entries(source as Record<string, unknown>)) {
+          const n = Math.floor(Number(value));
+          if (Number.isFinite(n) && n >= 0) {
+            nextMap[workflowId] = n;
+          }
+        }
+        setWorkflowPrechargePointsMap(nextMap);
+      } catch {
+        // ignore
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!authUserId) {
+      setDisabledWorkflowMap({});
+      return;
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const fetchDisabledWorkflows = async () => {
+      try {
+        const response = await fetch('/api/workflows/disabled', { cache: 'no-store' });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success || !Array.isArray(data.data)) return;
+        if (cancelled) return;
+        const nextMap: Record<string, DisabledWorkflowStatus> = {};
+        for (const row of data.data as DisabledWorkflowStatus[]) {
+          const workflowId = String(row?.workflowId || '');
+          if (!workflowId) continue;
+          nextMap[workflowId] = {
+            workflowId,
+            disabled: Boolean(row?.disabled),
+            reason: String(row?.reason || ''),
+            disabledAt: String(row?.disabledAt || ''),
+          };
+        }
+        setDisabledWorkflowMap(nextMap);
+      } catch {
+        // ignore
+      }
+    };
+
+    void fetchDisabledWorkflows();
+    timer = setInterval(() => {
+      void fetchDisabledWorkflows();
+    }, 30_000);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [authUserId, mergeServerQueueWithLocal]);
 
   const renderUserAvatar = (sizeClass: string) => {
     const mode = authUser?.avatarType === 'upload' ? 'upload' : 'default';
@@ -658,15 +871,42 @@ export default function DundunPro() {
 
   useEffect(() => {
     let cancelled = false;
+
+    // 立即从缓存恢复登录状态
+    try {
+      const cached = window.localStorage.getItem('auth_user_cache');
+      if (cached) {
+        const cachedUser = JSON.parse(cached) as AuthUser;
+        if (!cancelled) setAuthUser(cachedUser);
+      }
+    } catch { /* ignore */ }
+
+    // 后台验证 session 是否仍然有效
     void (async () => {
       try {
-        const response = await fetch('/api/me', { cache: 'no-store' });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        const response = await fetch('/api/me', { cache: 'no-store', signal: controller.signal });
+        clearTimeout(timeout);
         const data = await response.json().catch(() => null);
-        if (!cancelled && data?.success) {
-          setAuthUser(data.data);
+        if (!cancelled) {
+          if (data?.success && data?.data) {
+            setAuthUser(data.data);
+            try { window.localStorage.setItem('auth_user_cache', JSON.stringify(data.data)); } catch { /* ignore */ }
+          } else if (response.status === 401) {
+            // 仅在明确未授权时退出登录
+            setAuthUser(null);
+            try {
+              window.localStorage.removeItem('auth_user_cache');
+              window.localStorage.removeItem(BALANCE_KEY);
+              setUserAuthState(false);
+            } catch { /* ignore */ }
+          }
         }
+      } catch {
+        // 网络异常时保留当前登录态，避免误踢下线
       } finally {
-        if (!cancelled) setAuthLoading(false);
+        // no-op
       }
     })();
 
@@ -693,66 +933,76 @@ export default function DundunPro() {
     };
   }, [isUserMenuOpen]);
 
+  const ensureSessionForAction = async (): Promise<AuthUser | null> => {
+    try {
+      const response = await fetch('/api/me', { cache: 'no-store' });
+      const data = await response.json().catch(() => null);
+      if (response.ok && data?.success && data?.data) {
+        setAuthUser(data.data);
+        try { window.localStorage.setItem('auth_user_cache', JSON.stringify(data.data)); } catch { /* ignore */ }
+        return data.data as AuthUser;
+      }
+    } catch {
+      // ignore network issues here
+    }
+
+    setAuthUser(null);
+    setIsUserMenuOpen(false);
+    setShowAvatarModal(false);
+    setShowUsernameModal(false);
+    setShowPasswordModal(false);
+    setSessionExpiredNotice('登录态已失效，请重新登录。');
+    try {
+      window.localStorage.removeItem('auth_user_cache');
+      window.localStorage.removeItem(BALANCE_KEY);
+      setUserAuthState(false);
+    } catch { /* ignore */ }
+    setAuthMode('login');
+    setAuthError('请先登录后再继续操作');
+    return null;
+  };
+
   useEffect(() => {
-    if (!authUser) return;
+    if (!authUserId) return;
 
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
 
-    const checkSession = async () => {
+    const refreshMe = async () => {
       try {
         const response = await fetch('/api/me', { cache: 'no-store' });
-        if (cancelled) return;
-
-        if (response.status === 401) {
-          session401CountRef.current += 1;
-          if (session401CountRef.current < 2) {
-            return;
-          }
-          setAuthUser(null);
-          setIsUserMenuOpen(false);
-          setShowAvatarModal(false);
-          setShowUsernameModal(false);
-          setShowPasswordModal(false);
-          setSessionExpiredNotice('登录态已失效，已自动返回登录页，请重新登录。');
-          toast.error('登录态已失效，请重新登录');
-          return;
-        }
-
-        session401CountRef.current = 0;
-
         const data = await response.json().catch(() => null);
-        if (data?.success && data?.data) {
-          setAuthUser(data.data);
+        if (!cancelled && response.ok && data?.success && data?.data) {
+          setAuthUser(data.data as AuthUser);
+          try {
+            window.localStorage.setItem('auth_user_cache', JSON.stringify(data.data));
+          } catch {
+            // ignore
+          }
         }
       } catch {
-        // ignore network jitter
+        // ignore
       }
     };
 
-    const timer = setInterval(() => {
-      void checkSession();
-    }, 60 * 1000);
-
-    const onFocus = () => {
-      void checkSession();
+    const onFocusRefresh = () => {
+      void refreshMe();
     };
 
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') {
-        void checkSession();
-      }
-    };
-
-    window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onVisible);
+    void refreshMe();
+    window.addEventListener('focus', onFocusRefresh);
+    document.addEventListener('visibilitychange', onFocusRefresh);
+    timer = setInterval(() => {
+      void refreshMe();
+    }, 30_000);
 
     return () => {
       cancelled = true;
-      clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocusRefresh);
+      document.removeEventListener('visibilitychange', onFocusRefresh);
+      if (timer) clearInterval(timer);
     };
-  }, [authUser]);
+  }, [authUserId]);
 
   useEffect(() => {
     setProfileUsername(authUser?.username ?? '');
@@ -760,8 +1010,32 @@ export default function DundunPro() {
 
   useEffect(() => {
     if (authUserPoints == null) return;
-    setBalance(authUserPoints);
+
+    setUserBalance(authUserPoints);
   }, [authUserId, authUserPoints]);
+
+  useEffect(() => {
+    if (!authUserId) return;
+
+    void refreshUserBalance();
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void refreshUserBalance();
+    }, 10_000);
+
+    const onFocus = () => {
+      void refreshUserBalance();
+    };
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [authUserId]);
 
   useEffect(() => {
     if (!authUserId) return;
@@ -808,7 +1082,7 @@ export default function DundunPro() {
     let cancelled = false;
     void (async () => {
       try {
-        const response = await fetch('/api/me/tasks?page=1&pageSize=200', { cache: 'no-store' });
+        const response = await fetch('/api/me/tasks?page=1&pageSize=20', { cache: 'no-store' });
         const data = await response.json().catch(() => null);
         if (!response.ok || !data?.success || cancelled) return;
 
@@ -885,7 +1159,7 @@ export default function DundunPro() {
           }));
 
         if (queueFromServer.length > 0) {
-          setTaskQueue(queueFromServer);
+          setTaskQueue((prev) => mergeServerQueueWithLocal(queueFromServer, prev));
         }
       } catch {
         // ignore
@@ -934,12 +1208,6 @@ export default function DundunPro() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const rawBalance = window.localStorage.getItem(BALANCE_KEY);
-    if (rawBalance) {
-      const parsed = Number(rawBalance);
-      if (!Number.isNaN(parsed) && parsed >= 0) setBalance(parsed);
-    }
-
     const rawRecords = window.localStorage.getItem(RECHARGE_RECORDS_KEY);
     if (rawRecords) {
       try {
@@ -949,8 +1217,12 @@ export default function DundunPro() {
           const normalized = parsed
             .map((r) => {
               const createdAt = Number(r?.createdAt || now);
+              const points = Number(r?.points || 0);
+              const codePreview = String(r?.codePreview || '历史记录');
               return {
-                ...r,
+                id: String(r?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
+                codePreview,
+                points: Number.isFinite(points) ? points : 0,
                 createdAt: Number.isFinite(createdAt) ? createdAt : now,
               };
             })
@@ -1035,7 +1307,6 @@ export default function DundunPro() {
       setQueuePausedReason(rawPause as QueuePauseReason);
     }
 
-    setBalanceHydrated(true);
     setTaskQueueHydrated(true);
   }, []);
 
@@ -1084,12 +1355,6 @@ export default function DundunPro() {
       })
     );
   }, [historyRecordFilter]);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (!balanceHydrated) return;
-    window.localStorage.setItem(BALANCE_KEY, String(balance));
-  }, [balance, balanceHydrated]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1159,6 +1424,18 @@ export default function DundunPro() {
     }
     window.localStorage.setItem(QUEUE_PAUSE_REASON_KEY, queuePausedReason);
   }, [queuePausedReason]);
+
+  useEffect(() => {
+    const ids = new Set(taskQueue.map((item) => item.id));
+    setQueueCancellingIds((prev) => {
+      const next = new Set(Array.from(prev).filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+    setQueueCancelLockedIds((prev) => {
+      const next = new Set(Array.from(prev).filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [taskQueue]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1292,7 +1569,7 @@ export default function DundunPro() {
     else setAudioProgress(0);
 
     try {
-      const res = await fetch('/api/run', {
+      const res = await fetch('/api/ai', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1370,6 +1647,13 @@ export default function DundunPro() {
   };
 
   const runTask = async (payload: RetryPayload) => {
+    if (!authUserId) {
+      const freshUser = await ensureSessionForAction();
+      if (!freshUser?.id) return;
+    } else {
+      void ensureSessionForAction();
+    }
+
     if (workflowCenterLocked) {
       toast.error('工作流中心已临时禁用，请等待问题修复后再使用');
       return;
@@ -1380,37 +1664,10 @@ export default function DundunPro() {
       return;
     }
 
-    const pointsCost = payload.pointsCost ?? getWorkflowPointCostById(payload.workflowId);
+    const pointsCost = payload.pointsCost ?? getEffectiveWorkflowPointCost(payload.workflowId);
 
     if (balance < pointsCost) {
       toast.error(`积分不足，当前 ${balance} 积分，本次需要 ${pointsCost} 积分`);
-      return;
-    }
-
-    try {
-      const consumeRes = await fetch('/api/points/consume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          points: pointsCost,
-          reason: `工作流入队：${payload.workflowTitle}`,
-          relatedId: payload.workflowId,
-        }),
-      });
-      const consumeData = await consumeRes.json().catch(() => ({}));
-      if (!consumeRes.ok || !consumeData?.success) {
-        toast.error(consumeData?.message || '扣费失败，请稍后重试');
-        return;
-      }
-      setBalance(Number(consumeData?.data?.points ?? Math.max(0, balance - pointsCost)));
-      addPointLedgerItem({
-        type: 'expense',
-        points: pointsCost,
-        reason: `工作流入队：${payload.workflowTitle}`,
-        relatedId: payload.workflowId,
-      });
-    } catch {
-      toast.error('扣费失败，请稍后重试');
       return;
     }
 
@@ -1471,16 +1728,33 @@ export default function DundunPro() {
             requestId,
             expiresAt: Date.now() + REQUEST_ID_REUSE_WINDOW_MS,
           });
-          await fetch('/api/points/refund', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              points: pointsCost,
-              reason: `入队失败返还：${payload.workflowTitle}`,
-              relatedId: payload.workflowId,
-            }),
-          }).catch(() => undefined);
+          updateHistoryItem(historyId, {
+            status: 'cancelled',
+            error: enqueueData?.message || '任务入队失败',
+          });
           toast.error(enqueueData?.message || '任务入队失败');
+          return;
+        }
+
+        if (typeof enqueueData?.data?.points === 'number') {
+          setUserBalance(Number(enqueueData.data.points));
+        }
+
+        if (Number(enqueueData?.data?.queued || 0) === 0 && Number(enqueueData?.data?.duplicated || 0) > 0) {
+          updateHistoryItem(historyId, {
+            status: 'cancelled',
+            error: '请求重复，已忽略本次入队',
+          });
+          toast.info('检测到重复请求，系统已自动去重');
+          return;
+        }
+
+        if (Number(enqueueData?.data?.queued || 0) === 0 && Number(enqueueData?.data?.insufficientPoints || 0) > 0) {
+          updateHistoryItem(historyId, {
+            status: 'cancelled',
+            error: '积分不足，任务未入队',
+          });
+          toast.error('积分不足，任务未入队');
           return;
         }
 
@@ -1498,19 +1772,29 @@ export default function DundunPro() {
             submittedTaskId: null,
           },
         ]);
-        toast.info(`任务已入队，已扣除 ${pointsCost} 积分`);
+        addPointLedgerItem({
+          type: 'expense',
+          points: pointsCost,
+          reason: `任务积分预占：${payload.workflowTitle}`,
+          relatedId: payload.workflowId,
+        });
+        toast.info(`任务已入队，已预占 ${pointsCost} 积分`);
         return;
       } catch {
         enqueueRetryRequestIdRef.current.set(retryKey, {
           requestId,
           expiresAt: Date.now() + REQUEST_ID_REUSE_WINDOW_MS,
         });
+        updateHistoryItem(historyId, {
+          status: 'cancelled',
+          error: '任务入队失败，请稍后重试',
+        });
         toast.error('任务入队失败，请稍后重试');
         return;
       }
     }
 
-    toast.info(`任务已入队，已扣除 ${pointsCost} 积分`);
+    toast.info(`任务已入队，已预占 ${pointsCost} 积分`);
   };
 
   useEffect(() => {
@@ -1527,7 +1811,7 @@ export default function DundunPro() {
 
     queueRunnerRef.current = true;
     setTaskQueue((prev) => prev.map((t) => (t.id === next.id ? { ...t, state: 'running' } : t)));
-    const pointsCost = next.payload.pointsCost ?? getWorkflowPointCostById(next.payload.workflowId);
+    const pointsCost = next.payload.pointsCost ?? getEffectiveWorkflowPointCost(next.payload.workflowId);
     const requestId = next.requestId || next.payload.requestId || createRequestId();
     const historySnapshot = next.historyId ? history.find((item) => item.id === next.historyId) : null;
     const recoveredTaskId = next.submittedTaskId || historySnapshot?.taskId || null;
@@ -1615,11 +1899,24 @@ export default function DundunPro() {
     if (!authUserId) return;
 
     let cancelled = false;
+    let timer: number | null = null;
+    let round = 0;
+
+    const nextDelay = (hasActiveTasks: boolean) => {
+      const hidden = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+      if (hasActiveTasks) {
+        if (round < 4) return 1500;
+        if (round < 12) return hidden ? 5000 : 3000;
+        return hidden ? 9000 : 5000;
+      }
+      return hidden ? 20000 : 12000;
+    };
+
     const sync = async () => {
       try {
         const response = await fetch('/api/me/tasks?page=1&pageSize=200', { cache: 'no-store' });
         const data = await response.json().catch(() => null);
-        if (!response.ok || !data?.success || cancelled) return;
+        if (!response.ok || !data?.success || cancelled) return false;
         const rows = Array.isArray(data.data?.records) ? data.data.records : [];
 
         const mappedHistory: HistoryItem[] = rows.map((row: unknown) => {
@@ -1696,25 +1993,52 @@ export default function DundunPro() {
             if (a.state !== 'running' && b.state === 'running') return 1;
             return a.createdAt - b.createdAt;
           });
-        setTaskQueue(mappedQueue);
+        setTaskQueue((prev) => mergeServerQueueWithLocal(mappedQueue, prev));
+        return mappedQueue.length > 0;
       } catch {
-        // ignore
+        return false;
       }
     };
 
-    void sync();
-    const timer = setInterval(() => {
-      void sync();
-    }, 2500);
+    const runLoop = async () => {
+      const hasActiveTasks = await sync();
+      if (cancelled) return;
+      round += 1;
+      timer = window.setTimeout(() => {
+        void runLoop();
+      }, nextDelay(hasActiveTasks));
+    };
+
+    const forceRefresh = () => {
+      if (cancelled) return;
+      round = 0;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      void runLoop();
+    };
+
+    void runLoop();
+    window.addEventListener('focus', forceRefresh);
+    document.addEventListener('visibilitychange', forceRefresh);
 
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
+      window.removeEventListener('focus', forceRefresh);
+      document.removeEventListener('visibilitychange', forceRefresh);
     };
-  }, [authUserId]);
+  }, [authUserId, mergeServerQueueWithLocal]);
 
   const handleGenerate = async () => {
     if (!selectedWorkflow) return;
+
+    const disableMeta = getWorkflowDisableMeta(selectedWorkflow.workflowId);
+    if (disableMeta?.disabled) {
+      toast.error(`该应用已下架/维护中${disableMeta.reason ? `（${disableMeta.reason}）` : ''}`);
+      return;
+    }
 
     const missing = selectedWorkflow.inputs.find((i) => i.type === 'text' && !formData[i.key]);
     if (missing) {
@@ -1744,11 +2068,14 @@ export default function DundunPro() {
       workflowTitle: selectedWorkflow.title,
       inputs: JSON.parse(JSON.stringify(inputs)),
       isAudioWorkflow: selectedWorkflow.inputs.some((i) => i.type === 'audio'),
-      pointsCost: getWorkflowPointCostById(selectedWorkflow.workflowId),
+      pointsCost: getEffectiveWorkflowPointCost(selectedWorkflow.workflowId),
     });
   };
 
   const retryHistoryItem = async (item: HistoryItem) => {
+    const freshUser = await ensureSessionForAction();
+    if (!freshUser?.id) return;
+
     if (!item.retryPayload) {
       toast.error('该记录无重试参数（可能是刷新后历史），请重新手动提交一次');
       return;
@@ -1757,12 +2084,79 @@ export default function DundunPro() {
     await runTask({ ...item.retryPayload, requestId: createRequestId() });
   };
 
+  const confirmCancelResult = async (recordId: string, queueId: string) => {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    try {
+      const response = await fetch(
+        `/api/me/tasks?keyword=${encodeURIComponent(recordId)}&page=1&pageSize=50`,
+        { cache: 'no-store' }
+      );
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success) {
+        toast.info('取消结果确认中，请稍后刷新查看');
+        return;
+      }
+
+      const records = Array.isArray(data.data?.records) ? data.data.records : [];
+      const row = records.find((item: { id?: string }) => String(item.id || '') === recordId);
+      if (!row) {
+        toast.info('取消结果确认中，请稍后刷新查看');
+        return;
+      }
+
+      const status = String(row.status || '');
+      if (status === 'cancelled') {
+        toast.success('取消确认：任务已取消');
+        setQueueCancelLockedIds((prev) => {
+          const next = new Set(prev);
+          next.delete(queueId);
+          return next;
+        });
+        return;
+      }
+
+      if (status === 'success') {
+        setQueueCancelLockedIds((prev) => {
+          const next = new Set(prev);
+          next.add(queueId);
+          return next;
+        });
+        toast.info('取消确认：任务已完成生成，取消未生效');
+        return;
+      }
+
+      if (['failed', 'timeout'].includes(status)) {
+        toast.info(`取消确认：任务已结束（${status}）`);
+        return;
+      }
+
+      toast.info('取消结果确认中，请稍后刷新查看');
+    } catch {
+      toast.info('取消结果确认中，请稍后刷新查看');
+    }
+  };
+
   const cancelQueuedTask = (queueId: string) => {
-    const target = taskQueue.find((t) => t.id === queueId);
-    if (!target) return;
+    void (async () => {
+      const freshUser = await ensureSessionForAction();
+      if (!freshUser?.id) return;
+
+      const target = taskQueue.find((t) => t.id === queueId);
+      if (!target) return;
+      if (queueCancellingIds.has(queueId)) return;
+      if (queueCancelLockedIds.has(queueId)) {
+        toast.info('该任务已在后台完成生成，无法取消');
+        return;
+      }
 
     if (SERVER_QUEUE_EXECUTOR_ENABLED) {
       void (async () => {
+        setQueueCancellingIds((prev) => {
+          const next = new Set(prev);
+          next.add(queueId);
+          return next;
+        });
         try {
           const recordId = target.historyId || (queueId.startsWith('srv-') ? queueId.slice(4) : queueId);
           const response = await fetch('/api/tasks/cancel', {
@@ -1772,11 +2166,24 @@ export default function DundunPro() {
           });
           const data = await response.json().catch(() => ({}));
           if (!response.ok || !data?.success) {
+            if (response.status === 409 || String(data?.message || '').includes('已完成生成')) {
+              setQueueCancelLockedIds((prev) => {
+                const next = new Set(prev);
+                next.add(queueId);
+                return next;
+              });
+              void confirmCancelResult(recordId, queueId);
+            }
             toast.error(data?.message || '取消任务失败');
             return;
           }
 
           setTaskQueue((prev) => prev.filter((t) => t.id !== queueId));
+          setQueueCancelLockedIds((prev) => {
+            const next = new Set(prev);
+            next.delete(queueId);
+            return next;
+          });
           if (target.historyId) {
             updateHistoryItem(target.historyId, {
               status: 'cancelled',
@@ -1784,13 +2191,25 @@ export default function DundunPro() {
             });
           }
 
-          const refundPoints = Number(data?.data?.pointsCost || 0);
-          if (refundPoints > 0) {
-            setBalance((prev) => prev + refundPoints);
+          const refundPoints = Number(data?.data?.pointsDelta || 0);
+          const chargedPoints = Math.max(0, Number(data?.data?.chargedPoints || 0));
+          if (Boolean(data?.data?.refunded) && refundPoints > 0) {
+            setUserBalance(balance + refundPoints);
           }
-          toast.success('任务已取消');
+          if (target.state === 'running') {
+            toast.success(`执行中，实扣 ${chargedPoints} / 返还 ${refundPoints} 积分`);
+          } else {
+            toast.success(`未执行，已全额返还 ${refundPoints} 积分`);
+          }
+          void confirmCancelResult(recordId, queueId);
         } catch {
           toast.error('取消任务失败，请稍后重试');
+        } finally {
+          setQueueCancellingIds((prev) => {
+            const next = new Set(prev);
+            next.delete(queueId);
+            return next;
+          });
         }
       })();
       return;
@@ -1801,7 +2220,7 @@ export default function DundunPro() {
       return;
     }
 
-    const refundPoints = target.payload.pointsCost ?? getWorkflowPointCostById(target.payload.workflowId);
+    const refundPoints = target.payload.pointsCost ?? getEffectiveWorkflowPointCost(target.payload.workflowId);
 
     void (async () => {
       try {
@@ -1821,7 +2240,7 @@ export default function DundunPro() {
         }
 
         setTaskQueue((prev) => prev.filter((t) => t.id !== queueId));
-        setBalance(Number(refundData?.data?.points ?? balance + Math.max(0, refundPoints)));
+        setUserBalance(Number(refundData?.data?.points ?? balance + Math.max(0, refundPoints)));
         addPointLedgerItem({
           type: 'income',
           points: Math.max(0, refundPoints),
@@ -1838,6 +2257,7 @@ export default function DundunPro() {
       } catch {
         toast.error('返还积分失败，请稍后再试');
       }
+    })();
     })();
   };
 
@@ -2133,111 +2553,207 @@ export default function DundunPro() {
     });
   }, [selectedWorkflowTag, workflowKeyword]);
 
-  const rechargePackages = [
-    { points: 1000, amount: 10, tag: '体验包' },
-    { points: 5000, amount: 50, tag: '常用' },
-    { points: 10000, amount: 100, tag: '推荐' },
-    { points: 20000, amount: 200, tag: '企业' },
-  ];
+  const redeemPointsByCode = () => {
+    const code = redeemCodeInput.trim();
+    if (!code) {
+      toast.error('请输入兑换码');
+      return;
+    }
 
-  const doRecharge = (points: number, amount: number) => {
+    if (redeemSubmitting) return;
+
     void (async () => {
+      setRedeemSubmitting(true);
       try {
-        const createOrderRes = await fetch('/api/pay/orders', {
+        const response = await fetch('/api/redeem-codes/redeem', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            channel: paymentMethod,
-            amountFen: amount * 100,
-            points,
-            clientOrderNo: `CLIENT_${Date.now()}`,
-          }),
+          body: JSON.stringify({ code }),
         });
-        const createOrderData = await createOrderRes.json().catch(() => ({}));
-        if (!createOrderRes.ok || !createOrderData?.success) {
-          toast.error(createOrderData?.message || '创建订单失败，请稍后重试');
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success) {
+          toast.error(data?.message || '兑换失败，请稍后重试');
           return;
         }
 
-        const orderNo = String(createOrderData?.data?.orderNo || '');
-        if (!orderNo) {
-          toast.error('订单创建失败（缺少订单号）');
-          return;
-        }
+        const addedPoints = Number(data?.data?.addedPoints || 0);
+        const nextPoints = Number(data?.data?.points || balance + addedPoints);
+        setUserBalance(nextPoints);
+        setAuthUser((prev) => (prev ? { ...prev, points: nextPoints } : prev));
 
-        const mockPayRes = await fetch('/api/pay/mock/mark-paid', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ orderNo }),
-        });
-        const mockPayData = await mockPayRes.json().catch(() => ({}));
-        if (!mockPayRes.ok || !mockPayData?.success) {
-          toast.error(mockPayData?.message || '支付回调模拟失败');
-          return;
-        }
-
-        const meRes = await fetch('/api/me', { cache: 'no-store' });
-        const meData = await meRes.json().catch(() => ({}));
-        if (!meRes.ok || !meData?.success) {
-          toast.error('充值成功但刷新积分失败，请稍后刷新页面');
-          return;
-        }
-
-        setAuthUser(meData.data);
-        setBalance(Number(meData?.data?.points ?? balance + points));
         setRechargeRecords((prev) => [
           {
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            points,
-            amount,
+            codePreview: `${code.slice(0, 4).toUpperCase()}-****-${code.slice(-4).toUpperCase()}`,
+            points: addedPoints,
             createdAt: Date.now(),
           },
           ...prev,
         ]);
+
         addPointLedgerItem({
           type: 'income',
-          points,
-          reason: `充值到账 ¥${amount}`,
+          points: addedPoints,
+          reason: '兑换码积分到账',
         });
-        toast.success(`充值成功 +${points} 积分`);
+        setRedeemCodeInput('');
+        toast.success(`兑换成功 +${addedPoints} 积分`);
       } catch {
-        toast.error('充值入账失败，请稍后重试');
+        toast.error('兑换失败，请稍后重试');
+      } finally {
+        setRedeemSubmitting(false);
       }
     })();
   };
 
-  const handleRechargeSubmit = () => {
-    let amount: number | null = null;
-
-    if (selectedRechargeAmount !== null) {
-      amount = selectedRechargeAmount;
-    } else {
-      const raw = customRechargeAmount.trim();
-      if (!/^\d+$/.test(raw)) {
-        toast.error('请输入10-100000的整数金额');
-        return;
-      }
-
-      amount = Number(raw);
-      if (!Number.isInteger(amount) || amount < 10 || amount > 100000) {
-        toast.error('单次充值金额需为10到100000元的整数');
-        return;
-      }
+  const openRechargePayModal = () => {
+    if (rechargeCooldownSeconds > 0) {
+      toast.error(`操作过于频繁，请 ${rechargeCooldownSeconds} 秒后再试`);
+      return;
     }
 
-    setPendingRechargeAmount(amount);
-    setPaymentMethod('wechat');
-    setShowPaymentModal(true);
+    const amount = Number(rechargeAmountInput);
+    if (!Number.isInteger(amount) || amount < 10) {
+      toast.error('请输入不小于 10 元的整数金额');
+      return;
+    }
+
+    const payWindow = window.open('/pay/creating', '_blank');
+    if (!payWindow) {
+      toast.error('浏览器拦截了新窗口，请允许弹窗后重试');
+      return;
+    }
+
+    void (async () => {
+      try {
+        const response = await fetch('/api/pay/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            channel: rechargeChannel,
+            amountFen: amount * 100,
+            points: amount * 100,
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success || !data?.data?.orderNo) {
+          payWindow.close();
+          if (response.status === 429) {
+            setRechargeCooldownSeconds(60);
+          }
+          toast.error(data?.message || '创建充值订单失败');
+          return;
+        }
+        const payUrl = `/pay/${data.data.orderNo}`;
+        setPendingPayOrders((prev) => [{
+          orderNo: data.data.orderNo,
+          channel: rechargeChannel,
+          amountFen: amount * 100,
+          points: amount * 100,
+          status: 'pending',
+          createdAt: new Date().toISOString(),
+          expireAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+          remainingSeconds: 15 * 60,
+        }, ...prev.filter((item) => item.orderNo !== data.data.orderNo)].slice(0, 5));
+        setRechargeAmountInput('');
+        setSelectedRechargePreset(null);
+        setRechargeChannel('wechat');
+        payWindow.location.href = payUrl;
+        payWindow.focus();
+      } catch {
+        payWindow.close();
+        toast.error('创建充值订单失败，请稍后重试');
+      }
+    })();
   };
 
-  const handlePaymentSuccess = () => {
-    if (pendingRechargeAmount === null) return;
+  useEffect(() => {
+    if (rechargeCooldownSeconds <= 0) return;
+    const timer = setInterval(() => {
+      setRechargeCooldownSeconds((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [rechargeCooldownSeconds]);
 
-    doRecharge(pendingRechargeAmount * 100, pendingRechargeAmount);
-    setShowPaymentModal(false);
-    setPendingRechargeAmount(null);
-    setSelectedRechargeAmount(null);
-    setCustomRechargeAmount('');
+  const fetchLatestPendingPayOrder = useCallback(async () => {
+    try {
+      const response = await fetch('/api/pay/orders/pending/latest', { cache: 'no-store' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.success) return;
+      const list = Array.isArray(data?.data) ? (data.data as PendingPayOrder[]) : [];
+      setPendingPayOrders(list);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeView !== 'recharge' || rechargeTab !== 'points') return;
+    void fetchLatestPendingPayOrder();
+  }, [activeView, rechargeTab, fetchLatestPendingPayOrder]);
+
+  useEffect(() => {
+    if (pendingPayOrders.length === 0) return;
+    const timer = setInterval(() => {
+      setPendingPayTick(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [pendingPayOrders.length]);
+
+  useEffect(() => {
+    if (pendingPayOrders.length === 0) return;
+    const activeOrders = pendingPayOrders.filter((item) => {
+      const expireAtMs = new Date(item.expireAt).getTime();
+      if (Number.isNaN(expireAtMs)) return true;
+      return expireAtMs - pendingPayTick > 0;
+    });
+
+    if (activeOrders.length !== pendingPayOrders.length) {
+      setPendingPayOrders(activeOrders);
+      toast.info('订单已过期');
+      void fetchLatestPendingPayOrder();
+    }
+  }, [pendingPayOrders, pendingPayTick, fetchLatestPendingPayOrder]);
+
+  const closePendingPayOrder = (orderNo: string) => {
+    if (!orderNo || closingPendingPayOrder) return;
+    setClosingPendingPayOrder(true);
+    void (async () => {
+      try {
+        const response = await fetch(`/api/pay/orders/${orderNo}/close`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason: 'user_manual_close' }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success) {
+          toast.error(data?.message || '关闭订单失败');
+          return;
+        }
+        toast.success('待支付订单已关闭');
+        await fetchLatestPendingPayOrder();
+      } catch {
+        toast.error('关闭订单失败，请稍后重试');
+      } finally {
+        setClosingPendingPayOrder(false);
+      }
+    })();
+  };
+
+  const openPendingPayOrder = (orderNo: string) => {
+    if (!orderNo) return;
+    const opened = window.open(`/pay/${orderNo}`, '_blank');
+    if (!opened) {
+      toast.error('浏览器拦截了新窗口，请允许弹窗后重试');
+      return;
+    }
+    opened.focus();
   };
 
   const removeHistoryItem = (id: string) => {
@@ -2415,11 +2931,94 @@ export default function DundunPro() {
     setIsDraggingPreview(false);
   };
 
+  const clearAdvisorPressTimer = () => {
+    if (!advisorPressTimerRef.current) return;
+    clearTimeout(advisorPressTimerRef.current);
+    advisorPressTimerRef.current = null;
+  };
+
+  const startAdvisorPress = (clientX: number, clientY: number) => {
+    clearAdvisorPressTimer();
+    advisorLongPressActiveRef.current = false;
+
+    const buttonRect = advisorButtonRef.current?.getBoundingClientRect();
+    const initialX = advisorPosition?.x ?? (buttonRect?.left ?? Math.max(window.innerWidth - 112, 0));
+    const initialY = advisorPosition?.y ?? (buttonRect?.top ?? Math.max(window.innerHeight - 112, 0));
+
+    advisorDragStartRef.current = {
+      x: clientX,
+      y: clientY,
+      offsetX: clientX - initialX,
+      offsetY: clientY - initialY,
+    };
+
+    advisorPressTimerRef.current = setTimeout(() => {
+      advisorLongPressActiveRef.current = true;
+      advisorSuppressClickRef.current = true;
+      setAdvisorPosition((prev) => prev ?? { x: initialX, y: initialY });
+      setIsDraggingAdvisor(true);
+    }, 220);
+  };
+
+  const handleAdvisorDragMove = (clientX: number, clientY: number) => {
+    if (!advisorLongPressActiveRef.current || !isDraggingAdvisor) return;
+
+    const floatingSize = 80;
+    const maxX = Math.max(window.innerWidth - floatingSize, 0);
+    const maxY = Math.max(window.innerHeight - floatingSize, 0);
+    const nextX = Math.min(Math.max(clientX - advisorDragStartRef.current.offsetX, 0), maxX);
+    const nextY = Math.min(Math.max(clientY - advisorDragStartRef.current.offsetY, 0), maxY);
+
+    setAdvisorPosition({ x: nextX, y: nextY });
+  };
+
+  const stopAdvisorDragging = () => {
+    clearAdvisorPressTimer();
+    if (isDraggingAdvisor) {
+      setIsDraggingAdvisor(false);
+    }
+    advisorLongPressActiveRef.current = false;
+  };
+
   useEffect(() => {
     if (previewZoom <= 1) {
       setPreviewOffset({ x: 0, y: 0 });
     }
   }, [previewZoom]);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      handleAdvisorDragMove(event.clientX, event.clientY);
+    };
+
+    const handleTouchMove = (event: TouchEvent) => {
+      const touch = event.touches[0];
+      if (!touch) return;
+      handleAdvisorDragMove(touch.clientX, touch.clientY);
+      if (advisorLongPressActiveRef.current) {
+        event.preventDefault();
+      }
+    };
+
+    const handleDragEnd = () => {
+      stopAdvisorDragging();
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleDragEnd);
+    window.addEventListener('touchmove', handleTouchMove, { passive: false });
+    window.addEventListener('touchend', handleDragEnd);
+    window.addEventListener('touchcancel', handleDragEnd);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleDragEnd);
+      window.removeEventListener('touchmove', handleTouchMove);
+      window.removeEventListener('touchend', handleDragEnd);
+      window.removeEventListener('touchcancel', handleDragEnd);
+      clearAdvisorPressTimer();
+    };
+  }, [isDraggingAdvisor, advisorPosition]);
 
   useEffect(() => {
     if (!previewMedia) return;
@@ -2491,6 +3090,24 @@ export default function DundunPro() {
   const allFilteredSelected =
     filteredHistoryIds.length > 0 && filteredHistoryIds.every((id) => selectedHistoryIds.includes(id));
 
+  const historyTotalPages = Math.max(1, Math.ceil(filteredHistory.length / historyPageSize));
+  const historyPageSafe = Math.min(historyPage, historyTotalPages);
+  const historyPageNumbers = useMemo(() => buildPageNumbers(historyPageSafe, historyTotalPages), [historyPageSafe, historyTotalPages]);
+  const pagedHistory = useMemo(() => {
+    const start = (historyPageSafe - 1) * historyPageSize;
+    return filteredHistory.slice(start, start + historyPageSize);
+  }, [filteredHistory, historyPageSafe, historyPageSize]);
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [historyRecordFilter, historyPageSize]);
+
+  useEffect(() => {
+    if (historyPage > historyTotalPages) {
+      setHistoryPage(historyTotalPages);
+    }
+  }, [historyPage, historyTotalPages]);
+
   const getQueuedPosition = (queueId: string) => {
     const queuedOnly = taskQueue.filter((t) => t.state === 'queued');
     const idx = queuedOnly.findIndex((t) => t.id === queueId);
@@ -2540,22 +3157,63 @@ export default function DundunPro() {
   const isAdmin = authUser?.role === 'admin';
 
   const currentUserName = authUser?.username ?? '';
+  const authAccountTrimmed = authAccount.trim();
+  const authAccountLengthValid = authAccountTrimmed.length >= 8 && authAccountTrimmed.length <= 12;
+  const authAccountCharsetValid = /^\d*$/.test(authAccountTrimmed);
+  const authAccountValid = ACCOUNT_RE.test(authAccountTrimmed);
+  const authPasswordRules: ValidationRule[] = buildPasswordPolicyRules(authPassword, '密码');
+  const authPasswordValid = authPasswordRules.every((rule) => rule.valid);
+  const authPasswordConfirmValid = authMode !== 'register' || (authPasswordConfirm.length > 0 && authPassword === authPasswordConfirm);
+  const authAccountRules: ValidationRule[] = [
+    { label: '长度需在8-12位之间', valid: authAccountLengthValid, submitMessage: '账号长度需在8-12位之间' },
+    { label: '仅支持数字', valid: authAccountCharsetValid, submitMessage: '账号仅支持数字' },
+  ];
+  const authPasswordConfirmRules: ValidationRule[] = [
+    {
+      label: '两次输入的密码保持一致',
+      valid: authPasswordConfirm.length > 0 && authPassword === authPasswordConfirm,
+      submitMessage: authPasswordConfirm.length === 0 ? '请再次输入确认密码' : '两次输入的密码需保持一致',
+    },
+  ];
+  const authFormRules = [
+    ...authAccountRules,
+    ...authPasswordRules,
+    ...(authMode === 'register' ? authPasswordConfirmRules : []),
+  ];
+  const passwordNextConfirmValid = passwordConfirm.length > 0 && passwordNext === passwordConfirm;
+  const passwordNextRules: ValidationRule[] = buildPasswordPolicyRules(passwordNext, '新密码');
+  const passwordCurrentRules: ValidationRule[] = [
+    {
+      label: '已输入当前密码',
+      valid: passwordCurrent.length > 0,
+      submitMessage: '请输入当前密码',
+    },
+  ];
+  const passwordConfirmRules: ValidationRule[] = [
+    {
+      label: '两次新密码输入保持一致',
+      valid: passwordNextConfirmValid,
+      submitMessage: passwordConfirm.length === 0 ? '请再次输入新密码' : '两次新密码输入不一致',
+    },
+  ];
+  const passwordChangeRules: ValidationRule[] = [
+    ...passwordCurrentRules,
+    ...passwordNextRules,
+    ...passwordConfirmRules,
+  ];
+  const passwordChangeBlockedReason = passwordChangeRules.find((rule) => !rule.valid)?.submitMessage || '';
+  const authSubmitBlockedReason = authFormRules.find((rule) => !rule.valid)?.submitMessage || '';
+
   const submitAuth = async () => {
     setAuthError('');
 
-    const account = authAccount.trim();
+    const account = authAccountTrimmed;
     const password = authPassword;
 
-    if (!ACCOUNT_RE.test(account)) {
-      setAuthError('账号必须是10位纯数字');
-      return;
-    }
-    if (!PASSWORD_RE.test(password)) {
-      setAuthError('密码必须8-10位，且包含字母和数字');
-      return;
-    }
-    if (authMode === 'register' && password !== authPasswordConfirm) {
-      setAuthError('两次输入的密码不一致');
+    if (!authAccountValid || !authPasswordValid || !authPasswordConfirmValid) {
+      const message = authSubmitBlockedReason || '请先完成表单填写';
+      setAuthError(message);
+      toast.error(message);
       return;
     }
 
@@ -2574,6 +3232,7 @@ export default function DundunPro() {
       }
 
       setAuthUser(data.data);
+      try { window.localStorage.setItem('auth_user_cache', JSON.stringify(data.data)); } catch { /* ignore */ }
       setSessionExpiredNotice('');
       setAuthAccount('');
       setAuthPassword('');
@@ -2593,6 +3252,7 @@ export default function DundunPro() {
       await fetch('/api/auth/logout', { method: 'POST' });
     } finally {
       setAuthUser(null);
+      try { window.localStorage.removeItem('auth_user_cache'); } catch { /* ignore */ }
       setAuthMode('login');
       setAuthAccount('');
       setAuthPassword('');
@@ -2728,16 +3388,8 @@ export default function DundunPro() {
 
   const savePassword = async () => {
     if (!authUser) return;
-    if (!passwordCurrent) {
-      toast.error('请输入当前密码');
-      return;
-    }
-    if (!PASSWORD_RE.test(passwordNext)) {
-      toast.error('新密码必须8-10位，且包含字母和数字');
-      return;
-    }
-    if (passwordNext !== passwordConfirm) {
-      toast.error('两次新密码输入不一致');
+    if (passwordChangeBlockedReason) {
+      toast.error(passwordChangeBlockedReason);
       return;
     }
 
@@ -2778,98 +3430,165 @@ export default function DundunPro() {
     }));
   }, [pointLedger]);
 
-  if (authLoading) {
-    return (
-      <div className="min-h-screen bg-[#f4f6fb] flex items-center justify-center text-zinc-600">
-        正在加载登录状态...
-      </div>
-    );
-  }
+  const usageTotalPages = Math.max(1, Math.ceil(usageRowsInProfile.length / usagePageSize));
+  const usagePageSafe = Math.min(usagePage, usageTotalPages);
+  const usagePageNumbers = useMemo(() => buildPageNumbers(usagePageSafe, usageTotalPages), [usagePageSafe, usageTotalPages]);
+  const usageRowsPaged = useMemo(() => {
+    const start = (usagePageSafe - 1) * usagePageSize;
+    return usageRowsInProfile.slice(start, start + usagePageSize);
+  }, [usageRowsInProfile, usagePageSafe, usagePageSize]);
+
+  useEffect(() => {
+    if (usagePage > usageTotalPages) {
+      setUsagePage(usageTotalPages);
+    }
+  }, [usagePage, usageTotalPages]);
 
   if (!authUser) {
     return (
-      <div className="min-h-screen bg-[#f4f6fb] flex items-center justify-center p-4">
+      <div className="min-h-screen bg-gradient-to-br from-[#f0f4ff] to-[#f9f0ff] flex items-center justify-center p-4">
         <Toaster position="top-center" richColors />
-        <div className="w-full max-w-md bg-white border border-zinc-200 rounded-2xl p-6 shadow-xl">
-          <h1 className="text-2xl font-bold text-zinc-900 mb-1">吨吨AI Pro</h1>
-          <p className="text-sm text-zinc-500 mb-6">请先登录后继续使用工作流</p>
-
-          {sessionExpiredNotice ? (
-            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-              {sessionExpiredNotice}
+        <div className="w-full max-w-md">
+          {/* Logo区域 */}
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-[#266eff] to-[#a855f7] shadow-lg mb-4">
+              <span className="text-3xl">✨</span>
             </div>
-          ) : null}
-
-          <div className="inline-flex bg-zinc-100 rounded-xl p-1 mb-4 w-full">
-            <button
-              className={`flex-1 py-2 rounded-lg text-sm ${authMode === 'login' ? 'bg-zinc-900 text-white' : 'text-zinc-600'}`}
-              onClick={() => {
-                setAuthMode('login');
-                setAuthError('');
-              }}
-            >
-              登录
-            </button>
-            <button
-              className={`flex-1 py-2 rounded-lg text-sm ${authMode === 'register' ? 'bg-zinc-900 text-white' : 'text-zinc-600'}`}
-              onClick={() => {
-                setAuthMode('register');
-                setAuthError('');
-              }}
-            >
-              注册
-            </button>
+            <h1 className="text-3xl font-bold text-zinc-900">坤坤 AI</h1>
+            <p className="text-sm text-zinc-500 mt-1">AI工作流调用平台</p>
           </div>
 
-          <form
-            className="space-y-3"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (authSubmitting) return;
-              void submitAuth();
-            }}
-          >
-            <div>
-              <label className="block text-sm text-zinc-600 mb-1">账号</label>
-              <input
-                value={authAccount}
-                onChange={(e) => setAuthAccount(e.target.value.replace(/\D/g, '').slice(0, 10))}
-                placeholder="请输入10位数字账号"
-                className="w-full bg-white border border-zinc-300 rounded-xl px-3 py-2 text-zinc-800"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-zinc-600 mb-1">密码</label>
-              <input
-                type="password"
-                value={authPassword}
-                onChange={(e) => setAuthPassword(e.target.value)}
-                placeholder="8-10位，字母+数字组合"
-                className="w-full bg-white border border-zinc-300 rounded-xl px-3 py-2 text-zinc-800"
-              />
-            </div>
-            {authMode === 'register' && (
-              <div>
-                <label className="block text-sm text-zinc-600 mb-1">确认密码</label>
-                <input
-                  type="password"
-                  value={authPasswordConfirm}
-                  onChange={(e) => setAuthPasswordConfirm(e.target.value)}
-                  placeholder="请再次输入密码"
-                  className="w-full bg-white border border-zinc-300 rounded-xl px-3 py-2 text-zinc-800"
-                />
+          <div className="bg-white border border-zinc-200 rounded-2xl p-6 shadow-xl">
+            {sessionExpiredNotice ? (
+              <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-700 flex items-start gap-2">
+                <span className="mt-0.5">⚠️</span>
+                <span>{sessionExpiredNotice}</span>
               </div>
-            )}
-            {authError ? <p className="text-sm text-rose-500 mt-1">{authError}</p> : null}
+            ) : null}
 
-            <button
-              type="submit"
-              disabled={authSubmitting}
-              className="mt-4 w-full py-2.5 rounded-xl bg-zinc-900 text-white hover:bg-zinc-800 disabled:opacity-60"
+            {/* 登录/注册切换 */}
+            <div className="inline-flex bg-zinc-100 rounded-xl p-1 mb-5 w-full">
+              <button
+                className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${authMode === 'login' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}
+                onClick={() => { setAuthMode('login'); setAuthError(''); }}
+              >
+                登录
+              </button>
+              <button
+                className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${authMode === 'register' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}
+                onClick={() => { setAuthMode('register'); setAuthError(''); }}
+              >
+                注册账号
+              </button>
+            </div>
+
+            <form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (authSubmitting) return;
+                void submitAuth();
+              }}
             >
-              {authSubmitting ? '提交中...' : authMode === 'register' ? '注册并登录' : '登录'}
-            </button>
-          </form>
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-1.5">账号</label>
+                <input
+                  value={authAccount}
+                  onChange={(e) => {
+                    setAuthAccount(e.target.value.replace(/\D/g, '').slice(0, 12));
+                    setAuthError('');
+                  }}
+                  placeholder="请输入8-12位数字账号"
+                  autoComplete="username"
+                  inputMode="numeric"
+                  maxLength={12}
+                  className="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-4 py-2.5 text-zinc-800 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-[#266eff]/30 focus:border-[#266eff] transition"
+                />
+                {authMode === 'register' && <p className="text-xs text-zinc-400 mt-1">账号为8-12位纯数字，注册后不可修改</p>}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-1.5">密码</label>
+                <div className="relative">
+                  <input
+                    type={showAuthPassword ? 'text' : 'password'}
+                    value={authPassword}
+                    onChange={(e) => {
+                      setAuthPassword(e.target.value);
+                      setAuthError('');
+                    }}
+                    placeholder="8-20位，字母+数字组合"
+                    autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
+                    className="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-4 py-2.5 pr-10 text-zinc-800 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-[#266eff]/30 focus:border-[#266eff] transition"
+                  />
+                  <button type="button" onClick={() => setShowAuthPassword(!showAuthPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+                    {showAuthPassword ? (
+                      <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                    ) : (
+                      <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                    )}
+                  </button>
+                </div>
+                {authMode === 'register' && <p className="text-xs text-zinc-400 mt-1">8-20位，必须包含字母和数字</p>}
+              </div>
+
+              {authMode === 'register' && (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-700 mb-1.5">确认密码</label>
+                  <div className="relative">
+                    <input
+                      type={showAuthPasswordConfirm ? 'text' : 'password'}
+                      value={authPasswordConfirm}
+                      onChange={(e) => {
+                        setAuthPasswordConfirm(e.target.value);
+                        setAuthError('');
+                      }}
+                      placeholder="请再次输入密码"
+                      autoComplete="new-password"
+                      className="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-4 py-2.5 pr-10 text-zinc-800 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-[#266eff]/30 focus:border-[#266eff] transition"
+                    />
+                    <button type="button" onClick={() => setShowAuthPasswordConfirm(!showAuthPasswordConfirm)} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+                      {showAuthPasswordConfirm ? (
+                        <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                      ) : (
+                        <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                      )}
+                    </button>
+                  </div>
+                  <p className="text-xs text-zinc-400 mt-1">请再次输入相同密码</p>
+                </div>
+              )}
+
+              {authError ? (
+                <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-600 flex items-start gap-2">
+                  <span className="mt-0.5 shrink-0">✕</span>
+                  <span>{authError}</span>
+                </div>
+              ) : null}
+
+              <button
+                type="submit"
+                disabled={authSubmitting}
+                className="w-full py-3 rounded-xl bg-gradient-to-r from-[#266eff] to-[#a855f7] text-white font-semibold hover:opacity-90 disabled:opacity-60 transition shadow-md shadow-blue-200 mt-2"
+              >
+                {authSubmitting ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                    </svg>
+                    处理中...
+                  </span>
+                ) : authMode === 'register' ? '注册并登录' : '登录'}
+              </button>
+            </form>
+
+            {authMode === 'register' && (
+              <p className="text-xs text-zinc-400 text-center mt-4">
+                注册即表示同意平台服务条款，新用户赠送 <span className="text-[#266eff] font-medium">5积分</span>
+              </p>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -2904,6 +3623,10 @@ export default function DundunPro() {
       ) : (
         <div className="space-y-2">
           {taskQueue.map((q) => (
+            (() => {
+              const cancelling = queueCancellingIds.has(q.id);
+              const cancelLocked = queueCancelLockedIds.has(q.id);
+              return (
             <div
               key={q.id}
               className="flex items-center justify-between bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2"
@@ -2947,15 +3670,29 @@ export default function DundunPro() {
                   </button>
                   <button
                     onClick={() => cancelQueuedTask(q.id)}
-                    className={`text-xs text-zinc-700 px-2 py-1 rounded-lg border border-zinc-300 bg-white hover:bg-[#fff1f1] hover:text-rose-600 ${focusRingClass}`}
+                    disabled={cancelling || cancelLocked}
+                    title={cancelLocked ? '后台已完成生成，不可取消' : undefined}
+                    className={`text-xs text-zinc-700 px-2 py-1 rounded-lg border border-zinc-300 bg-white hover:bg-[#fff1f1] hover:text-rose-600 disabled:opacity-60 ${focusRingClass}`}
                   >
-                    取消
+                    {cancelling ? '取消中...' : cancelLocked ? '已完成' : '取消'}
                   </button>
                 </div>
               ) : (
-                <span className="text-xs text-violet-500">处理中</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-violet-500">处理中</span>
+                  <button
+                    onClick={() => cancelQueuedTask(q.id)}
+                    disabled={cancelling || cancelLocked}
+                    title={cancelLocked ? '后台已完成生成，不可取消' : undefined}
+                    className={`text-xs text-zinc-700 px-2 py-1 rounded-lg border border-zinc-300 bg-white hover:bg-[#fff1f1] hover:text-rose-600 disabled:opacity-60 ${focusRingClass}`}
+                  >
+                    {cancelling ? '取消中...' : cancelLocked ? '已完成' : '取消'}
+                  </button>
+                </div>
               )}
             </div>
+              );
+            })()
           ))}
         </div>
       )}
@@ -2963,11 +3700,11 @@ export default function DundunPro() {
   );
 
   return (
-    <div className="min-h-screen bg-[#f4f6fb] text-white flex">
+    <div className="h-screen overflow-hidden bg-[#f4f6fb] text-white flex">
       <Toaster position="top-center" richColors />
 
       {/* 左侧边栏 */}
-      <div className="w-72 bg-white border-r border-zinc-200 p-6 flex flex-col text-zinc-800">
+      <div className="w-72 h-screen shrink-0 bg-white border-r border-zinc-200 p-6 flex flex-col text-zinc-800">
         <div className="flex items-center gap-3 mb-10">
           <img src="/kunkun-logo.png" alt="坤坤 AI Logo" className="w-9 h-9 rounded-2xl object-cover" />
           <div>
@@ -2998,7 +3735,7 @@ export default function DundunPro() {
             }`}
           >
             <Wallet className="w-5 h-5" />
-            <span>充值</span>
+            <span>用户积分</span>
           </button>
 
           <button
@@ -3014,15 +3751,39 @@ export default function DundunPro() {
               <span>历史记录</span>
             </span>
           </button>
+
+          <button
+            onClick={() => setActiveView('referral')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl ${
+              activeView === 'referral'
+                ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] font-medium'
+                : 'text-zinc-600 hover:bg-[#f0f3f7] hover:text-zinc-800'
+            }`}
+          >
+            <Plus className="w-5 h-5" />
+            <span>推广计划</span>
+          </button>
+
+          <button
+            onClick={() => setActiveView('help')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl ${
+              activeView === 'help'
+                ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] font-medium'
+                : 'text-zinc-600 hover:bg-[#f0f3f7] hover:text-zinc-800'
+            }`}
+          >
+            <MessageCircle className="w-5 h-5" />
+            <span>帮助与反馈</span>
+          </button>
         </div>
 
       </div>
 
       {/* 主内容 */}
-      <div className="flex-1 overflow-auto">
-        <div className="bg-white border-b border-zinc-200 px-4 sm:px-6 lg:px-8 xl:px-10 py-3">
+      <div className="flex-1 h-screen flex flex-col overflow-hidden">
+        <div className="shrink-0 sticky top-0 z-30 bg-white border-b border-zinc-200 px-4 sm:px-6 lg:px-8 xl:px-10 py-3">
           <div className="flex items-center justify-between">
-            <div className="text-sm text-zinc-600">📢 通知：平台功能持续升级中，如遇问题请联系顾问</div>
+            <div className="text-sm text-zinc-600">📢 通知：{siteNoticeText}</div>
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-1 text-sm text-zinc-600 bg-zinc-100 rounded-full px-3 py-1">
                 <span>💰</span>
@@ -3079,11 +3840,14 @@ export default function DundunPro() {
           </div>
         </div>
 
-        <div className="max-w-[1720px] mx-auto px-4 sm:px-6 lg:px-8 xl:px-10 py-8 lg:py-10">
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-[1720px] mx-auto px-4 sm:px-6 lg:px-8 xl:px-10 py-8 lg:py-10">
           {activeView === 'workflows' ? (
             <>
-              <h1 className="text-4xl lg:text-[2.5rem] font-bold mb-3 text-zinc-900">打造真正能卖货的视觉内容</h1>
-              <p className="text-base lg:text-lg text-zinc-400 mb-10">产品图、广告视频、品牌内容，通过专业工作流快速交付</p>
+              <div className="text-center mb-10">
+                <h1 className="text-4xl lg:text-[2.5rem] font-bold mb-3 text-zinc-900">专业级 AI 视觉，快速落地任何创意</h1>
+                <p className="text-base lg:text-lg text-zinc-400">AI 驱动图像与视频生成，支持电商营销、品牌传播、内容创作等全场景高效交付。</p>
+              </div>
 
               <div className="bg-white border border-zinc-200 rounded-xl p-4 mb-6">
                 <div className="flex flex-col lg:flex-row gap-3 lg:items-center lg:justify-between">
@@ -3128,6 +3892,10 @@ export default function DundunPro() {
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-5">
                 {filteredWorkflows.map((wf) => (
+                  (() => {
+                    const disabledMeta = getWorkflowDisableMeta(wf.workflowId);
+                    const disabled = Boolean(disabledMeta?.disabled);
+                    return (
                   <Link
                     key={wf.id}
                     href={`/workflow-app/${wf.slug}`}
@@ -3137,32 +3905,40 @@ export default function DundunPro() {
                         toast.error('当前已临时禁用全部 AI 应用，请等待修复后再使用');
                         return;
                       }
+                      if (disabled) {
+                        e.preventDefault();
+                        toast.error(`该应用已下架/维护中${disabledMeta?.reason ? `（${disabledMeta.reason}）` : ''}`);
+                        return;
+                      }
                       setNavigatingSlug(wf.slug);
                     }}
-                    className={`bg-[#7f1010] border border-[#6f0d0d] rounded-2xl p-4 transition-all duration-200 transform-gpu group text-white ${
-                      workflowCenterLocked
+                    className={`card-item ${
+                      workflowCenterLocked || disabled
                         ? 'opacity-50 cursor-not-allowed'
-                        : 'hover:shadow-xl hover:scale-[1.02] cursor-pointer'
+                        : 'cursor-pointer'
                     }`}
+                    aria-disabled={workflowCenterLocked || disabled}
                   >
-                    <div className="flex justify-between mb-3">
-                      <div className="text-xs tracking-wide text-rose-100/80 uppercase">{wf.enTitle || 'Workflow'}</div>
-                    </div>
+                    {disabled ? (
+                      <div className="absolute left-3 top-3 z-10 text-[10px] px-2 py-0.5 rounded-full bg-zinc-900/80 border border-zinc-200/30 text-zinc-100">
+                        已下架/维护中
+                      </div>
+                    ) : null}
 
-                    <h3 className="font-bold text-xl mb-1 line-clamp-1">{wf.title}</h3>
-                    <p className="text-rose-100/90 text-sm mb-3 line-clamp-2">{wf.description}</p>
-
-                    <div className="rounded-xl overflow-hidden border border-white/10 mb-3 bg-white/10">
+                    <div className="relative">
                       <img
                         src={wf.coverImage || 'https://dundun2026.oss-cn-guangzhou.aliyuncs.com/waterfalls/20260326_e8d3f4780d11.jpg'}
                         alt={wf.title}
-                        className="w-full h-32 object-cover"
+                        className="card-item-image"
                         loading="lazy"
                       />
+                      <div className="card-title-overlay">
+                        <div className="line-clamp-2">{wf.description}</div>
+                      </div>
                     </div>
-
-                    <div className="text-[11px] text-rose-100/80 mb-3">模型：Qwen / FLUX / Wan2.2 可用 · 支持高一致性输出</div>
                   </Link>
+                    );
+                  })()
                 ))}
               </div>
 
@@ -3174,11 +3950,6 @@ export default function DundunPro() {
             </>
           ) : activeView === 'recharge' ? (
             <>
-              <div className="text-center mb-6">
-                <h1 className="text-4xl font-semibold text-zinc-800 mb-2">账户设置</h1>
-                <p className="text-zinc-500">管理您的账户信息、订阅支付</p>
-              </div>
-
               <div className="bg-white rounded-3xl p-5 shadow-sm border border-zinc-200">
                 <div className="bg-[#f5f7fa] rounded-3xl p-5 flex flex-col lg:flex-row gap-5 min-h-[720px]">
                   <div className="bg-white rounded-2xl w-full lg:w-[280px] p-3 flex lg:flex-col gap-2">
@@ -3200,28 +3971,7 @@ export default function DundunPro() {
                           : 'text-zinc-600 hover:bg-zinc-100'
                       }`}
                     >
-                      购买更多积分
-                    </button>
-                    <button
-                      onClick={() => setRechargeTab('referral')}
-                      className={`h-11 px-4 rounded-xl text-sm ${
-                        rechargeTab === 'referral'
-                          ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] font-medium'
-                          : 'text-zinc-600 hover:bg-zinc-100'
-                      }`}
-                    >
-                      推广计划
-                    </button>
-                    <div className="hidden lg:block my-1 h-px bg-zinc-200" />
-                    <button
-                      onClick={() => setRechargeTab('help')}
-                      className={`h-11 px-4 rounded-xl text-sm ${
-                        rechargeTab === 'help'
-                          ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] font-medium'
-                          : 'text-zinc-600 hover:bg-zinc-100'
-                      }`}
-                    >
-                      帮助与反馈
+                      积分中心
                     </button>
                   </div>
 
@@ -3278,7 +4028,7 @@ export default function DundunPro() {
                               onClick={() => setRechargeTab('points')}
                               className="h-11 px-6 rounded-xl btn-brand-gradient"
                             >
-                              购买更多积分
+                              前往积分中心
                             </button>
                           </div>
 
@@ -3304,7 +4054,7 @@ export default function DundunPro() {
                                     </td>
                                   </tr>
                                 ) : (
-                                  (showAllUsageInProfile ? usageRowsInProfile : usageRowsInProfile.slice(0, 8)).map((row) => (
+                                  usageRowsPaged.map((row) => (
                                     <tr key={row.id} className="border-b border-zinc-100">
                                       <td className="py-3 text-zinc-600">{row.time}</td>
                                       <td className="py-3 text-zinc-700" title={row.purpose}>
@@ -3320,14 +4070,58 @@ export default function DundunPro() {
                               </tbody>
                             </table>
                           </div>
-                          {usageRowsInProfile.length > 8 && (
-                            <div className="text-right mt-3">
-                              <button
-                                onClick={() => setShowAllUsageInProfile((v) => !v)}
-                                className="text-xs text-zinc-500 hover:text-[#266eff]"
-                              >
-                                {showAllUsageInProfile ? '收起' : '查看更多'} ›
-                              </button>
+                          {usageRowsInProfile.length > 0 && (
+                            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                              <div className="text-xs text-zinc-500">
+                                共 {usageRowsInProfile.length} 条，第 {usagePageSafe}/{usageTotalPages} 页
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <select
+                                  value={usagePageSize}
+                                  onChange={(e) => {
+                                    const next = Number(e.target.value) || 20;
+                                    setUsagePageSize(next);
+                                    setUsagePage(1);
+                                  }}
+                                  className="h-8 rounded-lg border border-zinc-200 px-2 text-xs text-zinc-700 bg-white focus:outline-none focus:ring-0 focus:border-zinc-200 no-focus-ring-zinc"
+                                >
+                                  <option value={10}>10/页</option>
+                                  <option value={20}>20/页</option>
+                                  <option value={50}>50/页</option>
+                                  <option value={100}>100/页</option>
+                                </select>
+                                <button
+                                  onClick={() => setUsagePage((p) => Math.max(1, p - 1))}
+                                  disabled={usagePageSafe <= 1}
+                                  className="h-8 px-3 rounded-lg border border-zinc-200 text-xs text-zinc-700 bg-white disabled:opacity-50"
+                                >
+                                  上一页
+                                </button>
+                                {usagePageNumbers.map((page, index) =>
+                                  page === 'ellipsis' ? (
+                                    <span key={`usage-ellipsis-${index}`} className="px-1 text-xs text-zinc-400">...</span>
+                                  ) : (
+                                    <button
+                                      key={`usage-page-${page}`}
+                                      onClick={() => setUsagePage(page)}
+                                      className={`h-8 min-w-8 px-2 rounded-lg border text-xs ${
+                                        page === usagePageSafe
+                                          ? 'bg-brand-gradient text-white border-transparent'
+                                          : 'border-zinc-200 text-zinc-700 bg-white'
+                                      }`}
+                                    >
+                                      {page}
+                                    </button>
+                                  )
+                                )}
+                                <button
+                                  onClick={() => setUsagePage((p) => Math.min(usageTotalPages, p + 1))}
+                                  disabled={usagePageSafe >= usageTotalPages}
+                                  className="h-8 px-3 rounded-lg border border-zinc-200 text-xs text-zinc-700 bg-white disabled:opacity-50"
+                                >
+                                  下一页
+                                </button>
+                              </div>
                             </div>
                           )}
                         </div>
@@ -3337,63 +4131,141 @@ export default function DundunPro() {
                     {rechargeTab === 'points' && (
                       <div className="space-y-5">
                         <div className="text-center mb-2">
-                          <div className="text-3xl font-semibold text-zinc-800">订阅会员</div>
-                          <div className="text-sm text-zinc-500 mt-2">基于产品特性，支付后不支持退款，请确认后购买。</div>
+                          <div className="text-3xl font-semibold text-zinc-800">用户积分</div>
+                          <div className="text-sm text-zinc-500 mt-2">基于产品的特殊性，本款产品完成支付后不支持退订，购买前仔细阅读产品权益。</div>
                         </div>
 
                         <div className="bg-white rounded-2xl p-7">
-                          <div className="text-zinc-600 mb-4">
-                            选择充值金额 <span className="text-xl font-semibold text-zinc-800">（1元 = 100积分）</span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-3 mb-4">
-                            {rechargePackages.map((pkg) => (
-                              <button
-                                key={pkg.amount}
-                                onClick={() => {
-                                  setSelectedRechargeAmount(pkg.amount);
-                                  setCustomRechargeAmount('');
-                                }}
-                                className={`h-12 px-6 rounded-full border text-sm transition-colors ${
-                                  selectedRechargeAmount === pkg.amount
-                                    ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] border-transparent text-[#266eff] font-medium'
-                                    : 'bg-white border-zinc-200 text-zinc-700 hover:border-[#d7e3ff] hover:text-[#266eff]'
-                                }`}
-                              >
-                                ¥{pkg.amount}
-                              </button>
-                            ))}
+                          <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">积分充值</div>
 
-                            <div className="h-12 rounded-full border border-zinc-200 bg-white px-4 inline-flex items-center gap-2">
-                              <span className="text-sm text-zinc-500">¥</span>
-                              <input
-                                value={customRechargeAmount}
-                                onChange={(e) => {
-                                  const value = e.target.value;
-                                  if (!/^\d*$/.test(value)) return;
-                                  setCustomRechargeAmount(value);
-                                  setSelectedRechargeAmount(null);
-                                }}
-                                inputMode="numeric"
-                                maxLength={6}
-                                placeholder="自定义金额"
-                                className="h-12 w-28 bg-transparent text-sm text-zinc-700 outline-none no-focus-ring"
-                              />
+                          {pendingPayOrders.length > 0 ? (
+                            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-zinc-700">
+                              <div className="font-medium text-zinc-800 mb-2">最近待支付订单</div>
+                              <div className="space-y-2">
+                                {pendingPayOrders.map((item) => {
+                                  const expireAtMs = new Date(item.expireAt).getTime();
+                                  const remain = Number.isNaN(expireAtMs) ? 0 : Math.max(0, Math.floor((expireAtMs - pendingPayTick) / 1000));
+                                  return (
+                                    <div key={item.orderNo} className="rounded-lg border border-amber-200 bg-white/70 px-3 py-2">
+                                      <div>订单号：{item.orderNo}</div>
+                                      <div>金额：￥{(item.amountFen / 100).toFixed(2)} · 渠道：{item.channel === 'wechat' ? '微信' : '支付宝'}</div>
+                                      <div className="text-xs text-zinc-600 mt-1">剩余支付时间：{String(Math.floor(remain / 60)).padStart(2, '0')}:{String(remain % 60).padStart(2, '0')}</div>
+                                      <div className="mt-2 flex gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => openPendingPayOrder(item.orderNo)}
+                                          className="h-8 px-3 rounded-lg bg-white border border-zinc-200 text-zinc-700 hover:bg-zinc-50"
+                                        >
+                                          继续支付
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => closePendingPayOrder(item.orderNo)}
+                                          disabled={closingPendingPayOrder}
+                                          className="h-8 px-3 rounded-lg bg-white border border-zinc-200 text-zinc-700 hover:bg-zinc-50 disabled:opacity-60"
+                                        >
+                                          {closingPendingPayOrder ? '关闭中...' : '关闭此订单'}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             </div>
+                          ) : null}
 
+                          <div className="mb-4">
+                            <div className="flex flex-wrap gap-2">
+                              {[10, 50, 100, 200].map((amount) => {
+                                const active = selectedRechargePreset === amount;
+                                return (
+                                  <button
+                                    key={amount}
+                                    type="button"
+                                    onClick={() => {
+                                      setRechargeAmountInput(String(amount));
+                                      setSelectedRechargePreset(amount);
+                                    }}
+                                    className={`h-12 px-5 rounded-xl text-base font-semibold border transition-colors ${
+                                      active
+                                        ? 'bg-brand-gradient text-white border-transparent'
+                                        : 'bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50'
+                                    }`}
+                                  >
+                                    ￥{amount}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="mb-4">
+                            <input
+                              value={rechargeAmountInput}
+                              onChange={(e) => {
+                                setRechargeAmountInput(e.target.value.replace(/[^\d]/g, ''));
+                                setSelectedRechargePreset(null);
+                              }}
+                              placeholder="请输入充值金额"
+                              className="w-full h-11 rounded-xl border border-zinc-200 px-3 text-sm font-semibold text-zinc-800 outline-none focus:outline-none focus:ring-0 focus:border-zinc-200 no-focus-ring-zinc"
+                            />
+                            <div className="text-sm text-zinc-500 mt-2">（1 元 = 100 积分，最低 10 元，仅支持整数）</div>
+                          </div>
+
+                          <div className="mb-4">
+                            <div className="text-base font-semibold text-zinc-800 mb-2">选择支付方式</div>
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setRechargeChannel('wechat')}
+                                className={`h-10 px-4 rounded-xl text-sm border ${rechargeChannel === 'wechat' ? 'bg-brand-gradient text-white border-transparent' : 'bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50'}`}
+                              >
+                                微信
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setRechargeChannel('alipay')}
+                                className={`h-10 px-4 rounded-xl text-sm border ${rechargeChannel === 'alipay' ? 'bg-brand-gradient text-white border-transparent' : 'bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50'}`}
+                              >
+                                支付宝
+                              </button>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={openRechargePayModal}
+                            disabled={rechargeCooldownSeconds > 0}
+                            className="h-11 px-8 rounded-xl bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] text-base font-semibold hover:brightness-95 transition"
+                          >
+                            {rechargeCooldownSeconds > 0 ? `${rechargeCooldownSeconds}秒后可重试` : '确认充值'}
+                          </button>
+                        </div>
+
+                        <div className="bg-white rounded-2xl p-7">
+                          <div className="space-y-3">
+                            <input
+                              value={redeemCodeInput}
+                              onChange={(e) => setRedeemCodeInput(e.target.value)}
+                              placeholder="请输入兑换码"
+                              autoComplete="off"
+                              className="w-full h-11 rounded-xl border border-zinc-200 px-3 text-sm text-zinc-800 outline-none focus:outline-none focus:ring-0 focus:border-zinc-200 no-focus-ring-zinc"
+                            />
                             <button
-                              onClick={handleRechargeSubmit}
-                              className="h-12 px-8 rounded-full bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] text-base font-semibold hover:brightness-95 transition"
+                              onClick={redeemPointsByCode}
+                              disabled={redeemSubmitting}
+                              className="h-11 px-8 rounded-xl bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] text-base font-semibold hover:brightness-95 transition disabled:opacity-60"
                             >
-                              充值
+                              {redeemSubmitting ? '兑换中...' : '立即兑换'}
                             </button>
                           </div>
-                          <div className="text-sm text-zinc-500">自定义金额仅支持10-100000元阿拉伯数字整数，点击“充值”后进入支付弹窗。</div>
+                          <div className="text-sm text-zinc-500 mt-3">如果你还没有兑换码，请点击右下角“专属顾问”获取兑换码。</div>
                         </div>
 
                         <div className="bg-white rounded-2xl p-7">
-                          <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">充值记录</div>
+                          <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">积分记录</div>
                           {rechargeRecords.length === 0 ? (
-                            <div className="py-8 text-center text-zinc-400">暂无充值记录</div>
+                            <div className="py-8 text-center text-zinc-400">暂无积分记录</div>
                           ) : (
                             <div className="space-y-2">
                               {rechargeRecords.map((r) => (
@@ -3401,7 +4273,7 @@ export default function DundunPro() {
                                   key={r.id}
                                   className="flex items-center justify-between rounded-xl border border-zinc-200 bg-[#f8faff] px-4 py-3"
                                 >
-                                  <div className="text-zinc-700">充值金额：¥{r.amount}</div>
+                                  <div className="text-zinc-700">兑换码：{r.codePreview}</div>
                                   <div className="text-zinc-700">获得积分：+{r.points}</div>
                                   <div className="text-zinc-500 text-xs">{formatTime(r.createdAt)}</div>
                                 </div>
@@ -3412,29 +4284,26 @@ export default function DundunPro() {
                       </div>
                     )}
 
-                    {rechargeTab === 'referral' && (
-                      <div className="bg-white rounded-2xl p-7">
-                        <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">推广计划</div>
-                        <div className="text-sm text-zinc-500">该功能暂未开放，敬请期待。</div>
-                      </div>
-                    )}
-
-                    {rechargeTab === 'help' && (
-                      <div className="bg-white rounded-2xl p-7">
-                        <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">帮助与反馈</div>
-                        <p className="text-zinc-600">如需帮助，请点击右下角“专属顾问”联系人工支持。</p>
-                        <div className="mt-4 rounded-xl border border-zinc-200 bg-[#f8faff] p-4 text-sm text-zinc-600 space-y-1">
-                          <div className="font-medium text-zinc-700">隐私与保存期限说明</div>
-                          <div>生成内容历史：默认保留15天。</div>
-                          <div>积分消费记录：保留15天。</div>
-                          <div>充值记录：保留1年。</div>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 </div>
               </div>
             </>
+          ) : activeView === 'referral' ? (
+            <div className="bg-white rounded-2xl p-7 border border-zinc-200">
+              <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">推广计划</div>
+              <div className="text-sm text-zinc-500">该功能暂未开放，敬请期待。</div>
+            </div>
+          ) : activeView === 'help' ? (
+            <div className="bg-white rounded-2xl p-7 border border-zinc-200">
+              <div className="text-base font-semibold text-zinc-800 mb-4 border-l-4 border-[#266eff] pl-3">帮助与反馈</div>
+              <p className="text-zinc-600">如需帮助，请点击右下角“专属顾问”联系人工支持。</p>
+              <div className="mt-4 rounded-xl border border-zinc-200 bg-[#f8faff] p-4 text-sm text-zinc-600 space-y-1">
+                <div className="font-medium text-zinc-700">隐私与保存期限说明</div>
+                <div>生成内容历史：默认保留15天。</div>
+                <div>积分消费记录：保留15天。</div>
+                <div>积分记录：保留1年。</div>
+              </div>
+            </div>
           ) : (
             <>
               <div className="flex items-center justify-between mb-6">
@@ -3533,9 +4402,12 @@ export default function DundunPro() {
                       />
                       全选当前筛选结果
                     </label>
-                    <span>已选 {selectedHistoryIds.length} 条</span>
+                    <div className="flex items-center gap-3">
+                      <span>已选 {selectedHistoryIds.length} 条</span>
+                      <span>共 {filteredHistory.length} 条，第 {historyPageSafe}/{historyTotalPages} 页</span>
+                    </div>
                   </div>
-                  {filteredHistory.map((item) => {
+                  {pagedHistory.map((item) => {
                     const meta = statusMeta(item.status);
                     const media: ResultMedia | null = item.resultUrl
                       ? { url: item.resultUrl, type: item.resultType || inferMediaType(item.resultUrl) }
@@ -3621,10 +4493,58 @@ export default function DundunPro() {
                       </div>
                     );
                   })}
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <select
+                      value={historyPageSize}
+                      onChange={(e) => {
+                        const next = Number(e.target.value) || 20;
+                        setHistoryPageSize(next);
+                        setHistoryPage(1);
+                      }}
+                      className="h-8 rounded-lg border border-zinc-200 px-2 text-xs text-zinc-700 bg-white focus:outline-none focus:ring-0 focus:border-zinc-200 no-focus-ring-zinc"
+                    >
+                      <option value={10}>10/页</option>
+                      <option value={20}>20/页</option>
+                      <option value={50}>50/页</option>
+                      <option value={100}>100/页</option>
+                    </select>
+                    <button
+                      onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                      disabled={historyPageSafe <= 1}
+                      className="h-8 px-3 rounded-lg border border-zinc-200 text-xs text-zinc-700 bg-white disabled:opacity-50 focus:outline-none"
+                    >
+                      上一页
+                    </button>
+                    {historyPageNumbers.map((page, index) =>
+                      page === 'ellipsis' ? (
+                        <span key={`history-ellipsis-${index}`} className="px-1 text-xs text-zinc-400">...</span>
+                      ) : (
+                        <button
+                          key={`history-page-${page}`}
+                          onClick={() => setHistoryPage(page)}
+                          className={`h-8 min-w-8 px-2 rounded-lg border text-xs ${
+                            page === historyPageSafe
+                              ? 'bg-brand-gradient text-white border-transparent'
+                              : 'border-zinc-200 text-zinc-700 bg-white'
+                          } focus:outline-none`}
+                        >
+                          {page}
+                        </button>
+                      )
+                    )}
+                    <button
+                      onClick={() => setHistoryPage((p) => Math.min(historyTotalPages, p + 1))}
+                      disabled={historyPageSafe >= historyTotalPages}
+                      className="h-8 px-3 rounded-lg border border-zinc-200 text-xs text-zinc-700 bg-white disabled:opacity-50 focus:outline-none"
+                    >
+                      下一页
+                    </button>
+                  </div>
                 </div>
               )}
             </>
           )}
+          </div>
         </div>
       </div>
 
@@ -3853,71 +4773,6 @@ export default function DundunPro() {
         </div>
       )}
 
-      {showPaymentModal && pendingRechargeAmount !== null && (
-        <div className="fixed inset-0 bg-black/60 z-[72] flex items-center justify-center p-4" onClick={() => setShowPaymentModal(false)}>
-          <div className="w-full max-w-md bg-white rounded-3xl p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-start justify-between mb-4">
-              <div>
-                <h3 className="text-xl font-semibold text-zinc-900">支付界面</h3>
-                <p className="text-sm text-zinc-500 mt-1">充值金额：¥{pendingRechargeAmount}</p>
-              </div>
-              <button
-                className="text-zinc-400 hover:text-zinc-700"
-                onClick={() => setShowPaymentModal(false)}
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              <button
-                onClick={() => setPaymentMethod('wechat')}
-                className={`h-11 rounded-xl border text-sm font-medium transition ${
-                  paymentMethod === 'wechat'
-                    ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] border-transparent text-[#266eff]'
-                    : 'border-zinc-200 text-zinc-700 hover:bg-zinc-50'
-                }`}
-              >
-                微信支付
-              </button>
-              <button
-                onClick={() => setPaymentMethod('alipay')}
-                className={`h-11 rounded-xl border text-sm font-medium transition ${
-                  paymentMethod === 'alipay'
-                    ? 'bg-gradient-to-r from-[#dde9ff] to-[#f9efff] border-transparent text-[#266eff]'
-                    : 'border-zinc-200 text-zinc-700 hover:bg-zinc-50'
-                }`}
-              >
-                支付宝支付
-              </button>
-            </div>
-
-            <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-4 text-center">
-              <div className="mb-2 text-base font-semibold text-zinc-800">充值金额：¥{pendingRechargeAmount}</div>
-              <p className="text-sm text-zinc-600 mb-3">
-                请使用{paymentMethod === 'wechat' ? '微信' : '支付宝'}扫码支付
-              </p>
-              <img
-                src={
-                  paymentMethod === 'wechat'
-                    ? 'https://dummyimage.com/260x260/f3f4f6/16a34a.png&text=WeChat+Pay+QR'
-                    : 'https://dummyimage.com/260x260/f3f4f6/2563eb.png&text=Alipay+QR'
-                }
-                alt={paymentMethod === 'wechat' ? '微信收款码' : '支付宝收款码'}
-                className="w-52 h-52 mx-auto rounded-xl border border-zinc-200 object-cover bg-white"
-              />
-            </div>
-
-            <button
-              onClick={handlePaymentSuccess}
-              className="w-full h-12 mt-4 rounded-xl bg-gradient-to-r from-[#dde9ff] to-[#f9efff] text-[#266eff] text-base font-semibold hover:brightness-95 transition"
-            >
-              我已完成支付
-            </button>
-          </div>
-        </div>
-      )}
-
       {showAvatarModal && (
         <div className="fixed inset-0 bg-black/55 z-[72] flex items-center justify-center p-4" onClick={() => setShowAvatarModal(false)}>
           <div className="w-full max-w-xl bg-white rounded-2xl p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
@@ -4011,7 +4866,7 @@ export default function DundunPro() {
               <input
                 value={profileUsername}
                 onChange={(e) => setProfileUsername(e.target.value)}
-                className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 text-zinc-800"
+                className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 text-zinc-800 no-focus-ring"
                 placeholder="请输入用户名（1-12位）"
               />
             </div>
@@ -4039,27 +4894,55 @@ export default function DundunPro() {
           <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-xl font-semibold text-zinc-900 mb-4">修改密码</h3>
             <div className="space-y-3 mb-4">
-              <input
-                type="password"
-                value={passwordCurrent}
-                onChange={(e) => setPasswordCurrent(e.target.value)}
-                className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 text-zinc-800"
-                placeholder="当前密码"
-              />
-              <input
-                type="password"
-                value={passwordNext}
-                onChange={(e) => setPasswordNext(e.target.value)}
-                className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 text-zinc-800"
-                placeholder="新密码（8-10位字母+数字）"
-              />
-              <input
-                type="password"
-                value={passwordConfirm}
-                onChange={(e) => setPasswordConfirm(e.target.value)}
-                className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 text-zinc-800"
-                placeholder="确认新密码"
-              />
+              <div className="relative">
+                <input
+                  type={showPasswordCurrent ? 'text' : 'password'}
+                  value={passwordCurrent}
+                  onChange={(e) => setPasswordCurrent(e.target.value)}
+                  className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 pr-10 text-zinc-800 no-focus-ring"
+                  placeholder="当前密码"
+                />
+                <button type="button" onClick={() => setShowPasswordCurrent(!showPasswordCurrent)} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+                  {showPasswordCurrent ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                  ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                  )}
+                </button>
+              </div>
+              <div className="relative">
+                <input
+                  type={showPasswordNext ? 'text' : 'password'}
+                  value={passwordNext}
+                  onChange={(e) => setPasswordNext(e.target.value)}
+                  className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 pr-10 text-zinc-800 no-focus-ring"
+                  placeholder="新密码（8-20位字母+数字）"
+                />
+                <button type="button" onClick={() => setShowPasswordNext(!showPasswordNext)} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+                  {showPasswordNext ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                  ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                  )}
+                </button>
+              </div>
+              <div className="relative">
+                <input
+                  type={showPasswordConfirm ? 'text' : 'password'}
+                  value={passwordConfirm}
+                  onChange={(e) => setPasswordConfirm(e.target.value)}
+                  className="w-full h-11 bg-[#f5f7fa] border border-zinc-200 rounded-xl px-3 pr-10 text-zinc-800 no-focus-ring"
+                  placeholder="确认新密码"
+                />
+                <button type="button" onClick={() => setShowPasswordConfirm(!showPasswordConfirm)} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+                  {showPasswordConfirm ? (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                  ) : (
+                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                  )}
+                </button>
+              </div>
+              <p className="text-xs text-zinc-400 mt-1">新密码需8-20位，包含字母和数字；并与确认密码一致</p>
             </div>
             <div className="flex gap-3">
               <button
@@ -4081,8 +4964,22 @@ export default function DundunPro() {
       )}
 
       <button
-        onClick={() => setShowAdvisorModal(true)}
-        className="fixed right-8 bottom-8 z-40 w-20 h-20 rounded-full bg-gradient-to-br from-sky-500 to-violet-500 shadow-xl shadow-violet-400/30 flex flex-col items-center justify-center text-white hover:translate-y-[-2px] transition"
+        ref={advisorButtonRef}
+        onClick={() => {
+          if (advisorSuppressClickRef.current) {
+            advisorSuppressClickRef.current = false;
+            return;
+          }
+          setShowAdvisorModal(true);
+        }}
+        onMouseDown={(e) => startAdvisorPress(e.clientX, e.clientY)}
+        onTouchStart={(e) => {
+          const touch = e.touches[0];
+          if (!touch) return;
+          startAdvisorPress(touch.clientX, touch.clientY);
+        }}
+        style={advisorPosition ? { left: `${advisorPosition.x}px`, top: `${advisorPosition.y}px` } : undefined}
+        className={`fixed z-40 w-20 h-20 rounded-full bg-gradient-to-br from-sky-500 to-violet-500 shadow-xl shadow-violet-400/30 flex flex-col items-center justify-center text-white transition ${advisorPosition ? '' : 'right-8 bottom-8'} ${isDraggingAdvisor ? 'cursor-grabbing' : 'cursor-grab hover:translate-y-[-2px]'}`}
       >
         <MessageCircle className="w-7 h-7" />
         <span className="text-xs mt-0.5">专属顾问</span>
@@ -4143,6 +5040,11 @@ export default function DundunPro() {
         .no-focus-ring:focus-visible {
           box-shadow: none !important;
           border-color: transparent !important;
+        }
+
+        .no-focus-ring-zinc:focus-visible {
+          box-shadow: none !important;
+          border-color: rgb(228 228 231) !important;
         }
       `}</style>
     </div>

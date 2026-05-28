@@ -10,10 +10,7 @@ export type SessionUser = {
   taskBlocked: boolean;
 };
 
-export async function getSessionUserFromRequest(request: Request): Promise<SessionUser | null> {
-  const token = getSessionTokenFromCookieHeader(request.headers.get('cookie'));
-  if (!token) return null;
-
+async function getSessionUserByToken(token: string): Promise<SessionUser | null> {
   try {
     const payload = await verifySessionToken(token);
     const user = await prisma.user.findUnique({
@@ -31,6 +28,16 @@ export async function getSessionUserFromRequest(request: Request): Promise<Sessi
   } catch {
     return null;
   }
+}
+
+export async function getSessionUserFromCookieHeader(cookieHeader: string | null): Promise<SessionUser | null> {
+  const token = getSessionTokenFromCookieHeader(cookieHeader);
+  if (!token) return null;
+  return getSessionUserByToken(token);
+}
+
+export async function getSessionUserFromRequest(request: Request): Promise<SessionUser | null> {
+  return getSessionUserFromCookieHeader(request.headers.get('cookie'));
 }
 
 export function isAdminUser(user: SessionUser | null): user is SessionUser {

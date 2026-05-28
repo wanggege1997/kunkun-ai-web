@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSessionUserFromRequest, isAdminUser } from '@/lib/server-auth';
+import { clearUserAutoBlock, pushSecurityEvent, pushSecurityAudit } from '@/lib/risk-control';
 
 export async function POST(
   request: Request,
@@ -31,8 +32,25 @@ export async function POST(
   const user = await prisma.user.update({
     where: { id: userId },
     data: { taskBlocked: blocked },
-    select: { id: true, taskBlocked: true },
+    select: { id: true, account: true, taskBlocked: true },
   });
+
+  await clearUserAutoBlock(userId).catch(() => undefined);
+  await pushSecurityEvent({
+    type: 'manual_block_changed',
+    userId: user.id,
+    account: user.account,
+    detail: blocked ? '管理员手动暂停用户任务权限' : '管理员手动恢复用户任务权限',
+    route: '/api/admin/users/[userId]/task-block',
+  }).catch(() => undefined);
+  await pushSecurityAudit({
+    userId: sessionUser.id,
+    account: sessionUser.account,
+    path: '/api/admin/users/[userId]/task-block',
+    action: blocked ? 'manual_block_user' : 'manual_unblock_user',
+    result: 'success',
+    status: 200,
+  }).catch(() => undefined);
 
   return NextResponse.json({ success: true, data: user });
 }
