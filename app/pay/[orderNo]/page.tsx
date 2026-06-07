@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import QRCode from 'qrcode';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { Toaster, toast } from 'sonner';
 import { refreshUserBalance } from '@/lib/user-balance-store';
@@ -50,6 +50,8 @@ function formatRemaining(seconds: number) {
 }
 
 const ORDER_EXPIRE_MS = 15 * 60 * 1000;
+const PAY_ORDER_SYNC_EVENT = 'kunkun-pay-order-updated';
+const PAY_ORDER_SYNC_STORAGE_KEY = 'kunkun-pay-order-sync-v1';
 
 export default function PayOrderPage() {
   const params = useParams<{ orderNo: string }>();
@@ -63,6 +65,7 @@ export default function PayOrderPage() {
   const [closingExpired, setClosingExpired] = useState(false);
   const [pollingBlocked, setPollingBlocked] = useState(false);
   const [orderAccessDenied, setOrderAccessDenied] = useState(false);
+  const notifiedStatusRef = useRef('');
 
   const amountYuan = useMemo(() => ((order?.amountFen || 0) / 100).toFixed(2), [order?.amountFen]);
   const loginHref = useMemo(
@@ -107,6 +110,39 @@ export default function PayOrderPage() {
     setOrder((prev) => (prev ? { ...prev, ...(data.data as PayOrder) } : prev));
   }, [orderNo]);
 
+  const notifyOrderUpdated = useCallback((nextOrder: PayOrder) => {
+    if (typeof window === 'undefined') return;
+
+    const payload = {
+      type: PAY_ORDER_SYNC_EVENT,
+      orderNo: nextOrder.orderNo,
+      status: nextOrder.status,
+      points: nextOrder.points,
+      amountFen: nextOrder.amountFen,
+      updatedAt: Date.now(),
+    };
+
+    try {
+      window.opener?.postMessage(payload, window.location.origin);
+    } catch {
+      // ignore cross-window notification failure
+    }
+
+    try {
+      const channel = new BroadcastChannel(PAY_ORDER_SYNC_EVENT);
+      channel.postMessage(payload);
+      channel.close();
+    } catch {
+      // ignore unsupported BroadcastChannel
+    }
+
+    try {
+      window.localStorage.setItem(PAY_ORDER_SYNC_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // ignore storage notification failure
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -138,9 +174,13 @@ export default function PayOrderPage() {
   }, [isPending, order, orderNo, pollingBlocked, queryOrderStatus]);
 
   useEffect(() => {
-    if (!paidOrCredited) return;
+    if (!paidOrCredited || !order) return;
+    const notifyKey = `${order.orderNo}:${order.status}`;
+    if (notifiedStatusRef.current === notifyKey) return;
+    notifiedStatusRef.current = notifyKey;
+    notifyOrderUpdated(order);
     void refreshUserBalance();
-  }, [paidOrCredited]);
+  }, [order, paidOrCredited, notifyOrderUpdated]);
 
   useEffect(() => {
     if (!order) return;

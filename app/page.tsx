@@ -256,6 +256,8 @@ const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const POINT_LEDGER_TTL_MS = 15 * 24 * 60 * 60 * 1000;
 const SERVER_QUEUE_EXECUTOR_ENABLED = true;
 const ACCOUNT_RE = /^\d{8,12}$/;
+const PAY_ORDER_SYNC_EVENT = 'kunkun-pay-order-updated';
+const PAY_ORDER_SYNC_STORAGE_KEY = 'kunkun-pay-order-sync-v1';
 
 function buildPasswordPolicyRules(value: string, submitFieldName: string): ValidationRule[] {
   const lengthValid = value.length >= 8 && value.length <= 20;
@@ -633,6 +635,7 @@ export default function DundunPro() {
   const advisorDragStartRef = useRef({ x: 0, y: 0, offsetX: 0, offsetY: 0 });
   const advisorLongPressActiveRef = useRef(false);
   const advisorSuppressClickRef = useRef(false);
+  const pendingPaySyncHandledRef = useRef<Map<string, number>>(new Map());
 
   const currentWorkflowIsAudio = useMemo(
     () => !!selectedWorkflow?.inputs.some((i) => i.type === 'audio'),
@@ -2721,10 +2724,83 @@ export default function DundunPro() {
     }
   }, []);
 
+  const syncPayOrderUpdate = useCallback((payload: unknown) => {
+    const event = payload as {
+      type?: unknown;
+      orderNo?: unknown;
+      status?: unknown;
+      updatedAt?: unknown;
+    };
+    if (event?.type !== PAY_ORDER_SYNC_EVENT) return;
+
+    const orderNo = typeof event.orderNo === 'string' ? event.orderNo : '';
+    const status = String(event.status || '').toLowerCase();
+    if (!orderNo || !status) return;
+
+    const dedupeKey = `${orderNo}:${status}:${String(event.updatedAt || '')}`;
+    const now = Date.now();
+    const lastHandledAt = pendingPaySyncHandledRef.current.get(dedupeKey) || 0;
+    if (now - lastHandledAt < 3000) return;
+    pendingPaySyncHandledRef.current.set(dedupeKey, now);
+
+    if (status !== 'pending') {
+      setPendingPayOrders((prev) => prev.filter((item) => item.orderNo !== orderNo));
+    }
+
+    void fetchLatestPendingPayOrder();
+    if (status === 'paid' || status === 'credited') {
+      void refreshUserBalance();
+    }
+  }, [fetchLatestPendingPayOrder]);
+
   useEffect(() => {
     if (activeView !== 'recharge' || rechargeTab !== 'points') return;
     void fetchLatestPendingPayOrder();
   }, [activeView, rechargeTab, fetchLatestPendingPayOrder]);
+
+  useEffect(() => {
+    if (!authUserId) return;
+
+    const onFocusRefreshPendingPay = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void fetchLatestPendingPayOrder();
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      syncPayOrderUpdate(event.data);
+    };
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== PAY_ORDER_SYNC_STORAGE_KEY || !event.newValue) return;
+      try {
+        syncPayOrderUpdate(JSON.parse(event.newValue));
+      } catch {
+        // ignore malformed storage payload
+      }
+    };
+
+    window.addEventListener('focus', onFocusRefreshPendingPay);
+    document.addEventListener('visibilitychange', onFocusRefreshPendingPay);
+    window.addEventListener('message', onMessage);
+    window.addEventListener('storage', onStorage);
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(PAY_ORDER_SYNC_EVENT);
+      channel.onmessage = (event) => syncPayOrderUpdate(event.data);
+    } catch {
+      channel = null;
+    }
+
+    return () => {
+      window.removeEventListener('focus', onFocusRefreshPendingPay);
+      document.removeEventListener('visibilitychange', onFocusRefreshPendingPay);
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('storage', onStorage);
+      channel?.close();
+    };
+  }, [authUserId, fetchLatestPendingPayOrder, syncPayOrderUpdate]);
 
   useEffect(() => {
     if (pendingPayOrders.length === 0) return;

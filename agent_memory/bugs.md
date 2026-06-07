@@ -6,3 +6,4 @@
 - 当前无法真实扫码支付验证，需要生产环境变量、回调域名、公钥/私钥文件和公网环境配合联调。
 - 服务器侧已验证 `pm2` 和 HTTPS 能返回 200；曾出现 `next start 3000` 被当成目录参数导致 PM2 反复重启，应统一使用 `next start -p 3000` 或 `ecosystem.config.cjs`。
 - 宝塔/Nginx 曾从 `/www/server/nginx/proxy_cache_dir` 返回旧首页 HTML，导致域名 HTML 引用旧 `/_next/static` 文件；Next.js 站点应关闭首页和 API 的反向代理缓存，部署后如异常需清理该缓存目录并 reload Nginx。
+- 已复现并修复一个支付体验问题：支付页在新窗口完成支付后，原窗口不会自动刷新“最近待支付订单”，需要通过跨窗口事件和焦点刷新同步支付状态。
