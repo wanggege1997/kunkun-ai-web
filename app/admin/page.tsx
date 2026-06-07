@@ -48,8 +48,14 @@ type UserOrder = {
   amountFen: number;
   points: number;
   status: string;
+  gatewayStatus: string | null;
   thirdTradeNo: string | null;
+  paidAmountFen: number | null;
   paidAt: string | null;
+  refundNo: string | null;
+  refundAmountFen: number | null;
+  refundStatus: string | null;
+  refundedAt: string | null;
   createdAt: string;
 };
 
@@ -1102,6 +1108,36 @@ export default function AdminPage() {
       toast.success(next ? '该用户已暂停任务执行' : '该用户已恢复任务执行');
     } catch {
       toast.error('更新失败，请稍后重试');
+    }
+  };
+
+  const refundPaymentOrder = async (order: UserOrder) => {
+    if (!selectedUser) {
+      toast.error('请先选择用户');
+      return;
+    }
+    if (order.channel !== 'wechat' || order.status !== 'credited') {
+      toast.error('仅支持已到账微信订单人工退款');
+      return;
+    }
+    const ok = window.confirm(`确认对订单 ${order.orderNo} 发起微信退款？退款成功后会回退对应积分。`);
+    if (!ok) return;
+
+    try {
+      const response = await fetch('/api/admin/pay/refund', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderNo: order.orderNo, reason: '商户后台人工退款' }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.success) {
+        toast.error(data?.message || '发起退款失败');
+        return;
+      }
+      toast.success('已发起微信退款，请等待退款回调确认');
+      void fetchSelectedUserSummary(selectedUser.id);
+    } catch {
+      toast.error('发起退款失败，请稍后重试');
     }
   };
 
@@ -2494,6 +2530,22 @@ export default function AdminPage() {
                             <div className="text-zinc-600">
                               金额 ¥{(order.amountFen / 100).toFixed(2)} · 积分 {order.points} · 状态 {order.status}
                             </div>
+                            {order.gatewayStatus || order.refundStatus ? (
+                              <div className="text-zinc-500 mt-1">
+                                {order.gatewayStatus ? `渠道 ${order.gatewayStatus}` : ''}
+                                {order.gatewayStatus && order.refundStatus ? ' · ' : ''}
+                                {order.refundStatus ? `退款 ${order.refundStatus}` : ''}
+                              </div>
+                            ) : null}
+                            {order.channel === 'wechat' && order.status === 'credited' ? (
+                              <button
+                                type="button"
+                                onClick={() => void refundPaymentOrder(order)}
+                                className="mt-2 h-7 px-2 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 text-[11px]"
+                              >
+                                人工退款
+                              </button>
+                            ) : null}
                           </div>
                         ))
                       )}

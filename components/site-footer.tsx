@@ -49,11 +49,13 @@ export function SiteFooter() {
             className="inline-flex items-center gap-1 hover:text-zinc-900"
           >
             {/* 公安备案要求展示官方图标；图标来源为全国互联网安全管理服务平台。 */}
+            {/* eslint-disable-next-line @next/next/no-img-element -- 官方备案图标保持外链原样展示 */}
             <img src={POLICE_ICON_URL} alt="公安备案图标" className="h-4 w-4" />
             <span>{policeRecordNumber}</span>
           </a>
         ) : (
           <span className="inline-flex items-center gap-1">
+            {/* eslint-disable-next-line @next/next/no-img-element -- 官方备案图标保持外链原样展示 */}
             <img src={POLICE_ICON_URL} alt="公安备案图标" className="h-4 w-4" />
             <span>公安备案号待配置</span>
           </span>

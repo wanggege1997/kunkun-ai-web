@@ -3,7 +3,7 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import { ArrowLeft, Download } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { getWorkflowBySlug, getWorkflowPointCost } from '@/lib/workflows';
@@ -178,6 +178,7 @@ function renderMediaPreview(
 
 export default function WorkflowDetailPage() {
   const params = useParams<{ slug: string }>();
+  const router = useRouter();
   const slug = String(params?.slug || '');
 
   const workflow = useMemo(() => getWorkflowBySlug(slug), [slug]);
@@ -251,8 +252,15 @@ export default function WorkflowDetailPage() {
   const workflowDisabledReason = String(disabledWorkflowMeta?.reason || '').trim();
 
   useEffect(() => {
+    if (!authReady || isAuthed) return;
+    const returnTo = slug ? `/workflow-app/${encodeURIComponent(slug)}` : '/';
+    router.replace(`/?login=1&expired=1&returnTo=${encodeURIComponent(returnTo)}`);
+  }, [authReady, isAuthed, router, slug]);
+
+  useEffect(() => {
+    if (authReady && !isAuthed) return;
+
     let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
 
     const syncBalance = async () => {
       if (cancelled) return;
@@ -260,6 +268,14 @@ export default function WorkflowDetailPage() {
     };
 
     void syncBalance();
+
+    if (!isAuthed) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    let timer: ReturnType<typeof setInterval> | null = null;
 
     const onFocusOrVisible = () => {
       void syncBalance();
@@ -279,7 +295,7 @@ export default function WorkflowDetailPage() {
       window.removeEventListener('focus', onFocusOrVisible);
       document.removeEventListener('visibilitychange', onFocusOrVisible);
     };
-  }, []);
+  }, [authReady, isAuthed]);
 
   useEffect(() => {
     let cancelled = false;
@@ -383,6 +399,19 @@ export default function WorkflowDetailPage() {
       } catch {
         // ignore cache read errors
       }
+    }
+
+    if (!authReady) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!isAuthed) {
+      setQueueCount(0);
+      return () => {
+        cancelled = true;
+      };
     }
 
     const syncHistoryFromServer = async () => {
@@ -491,7 +520,7 @@ export default function WorkflowDetailPage() {
       window.removeEventListener('focus', forceRefresh);
       document.removeEventListener('visibilitychange', forceRefresh);
     };
-  }, []);
+  }, [authReady, isAuthed]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -547,6 +576,19 @@ export default function WorkflowDetailPage() {
     let cancelled = false;
     let timer: number | null = null;
     let round = 0;
+
+    if (!authReady) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!isAuthed) {
+      setQueueCount(0);
+      return () => {
+        cancelled = true;
+      };
+    }
 
     const syncQueueCount = async () => {
       try {
@@ -613,7 +655,7 @@ export default function WorkflowDetailPage() {
       window.removeEventListener('focus', forceRefresh);
       document.removeEventListener('visibilitychange', forceRefresh);
     };
-  }, []);
+  }, [authReady, isAuthed]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !workflow) return;

@@ -1,5 +1,5 @@
-﻿import { NextResponse } from 'next/server';
-import { creditPaymentOrder } from '@/lib/payment-service';
+import { NextResponse } from 'next/server';
+import { finalizeWechatRefund } from '@/lib/payment-service';
 import {
   decryptWechatNotificationResource,
   getWechatPayConfig,
@@ -25,8 +25,8 @@ export async function POST(request: Request) {
   }
 
   const eventType = String(body.event_type || '').toUpperCase();
-  if (eventType !== 'TRANSACTION.SUCCESS') {
-    return NextResponse.json({ success: true, message: '已忽略非支付成功回调' });
+  if (!eventType.startsWith('REFUND.')) {
+    return NextResponse.json({ success: true, message: '已忽略非退款回调' });
   }
 
   const resource = body.resource as {
@@ -39,13 +39,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: false, message: '回调资源缺失' }, { status: 400 });
   }
 
-  if (resource.algorithm && resource.algorithm !== 'AEAD_AES_256_GCM') {
-    return NextResponse.json({ success: false, message: '不支持的回调加密算法' }, { status: 400 });
-  }
-
-  let transaction: Record<string, unknown>;
+  let refund: Record<string, unknown>;
   try {
-    transaction = decryptWechatNotificationResource({
+    refund = decryptWechatNotificationResource({
       algorithm: resource.algorithm || 'AEAD_AES_256_GCM',
       ciphertext: resource.ciphertext,
       associated_data: resource.associated_data,
@@ -56,32 +52,28 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: false, message }, { status: 400 });
   }
 
-  const orderNo = String(transaction.out_trade_no || '').trim();
-  const transactionId = String(transaction.transaction_id || '').trim();
-  const tradeState = String(transaction.trade_state || '').toUpperCase();
-  const total = Number((transaction.amount as { total?: unknown } | undefined)?.total || 0);
-  const successTime = String(transaction.success_time || '').trim();
+  const orderNo = String(refund.out_trade_no || '').trim();
+  const refundId = String(refund.refund_id || '').trim() || null;
+  const refundStatus = String(refund.refund_status || refund.status || '').toUpperCase();
+  const successTimeRaw = String(refund.success_time || '').trim();
+  const successTime = successTimeRaw ? new Date(successTimeRaw) : null;
 
   if (!orderNo) {
     return NextResponse.json({ success: false, message: '缺少订单号' }, { status: 400 });
   }
 
-  if (tradeState !== 'SUCCESS') {
-    return NextResponse.json({ success: true, message: '已忽略非成功交易状态' });
-  }
-
   try {
-    await creditPaymentOrder({
+    await finalizeWechatRefund(
       orderNo,
-      thirdTradeNo: transactionId,
-      paidAmountFen: Number.isInteger(total) && total > 0 ? total : 0,
-      paidAt: successTime ? new Date(successTime) : new Date(),
-      rawNotify: body,
-    });
+      refundStatus || eventType.replace('REFUND.', ''),
+      refundId,
+      successTime && !Number.isNaN(successTime.getTime()) ? successTime : null
+    );
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : '入账失败';
+    const message = error instanceof Error ? error.message : '退款状态更新失败';
     return NextResponse.json({ success: false, message }, { status: 500 });
   }
 
   return NextResponse.json({ success: true, message: 'success' });
 }
+

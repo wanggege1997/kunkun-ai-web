@@ -193,6 +193,13 @@ function buildEnqueueRetryKey(payload: RetryPayload) {
   ].join('|');
 }
 
+function getSafeReturnTo(value: string | null) {
+  if (!value) return '';
+  if (!value.startsWith('/') || value.startsWith('//')) return '';
+  if (value.startsWith('/api/')) return '';
+  return value;
+}
+
 function persistTaskIdToLocalStorage(historyId: string, taskId: string) {
   if (typeof window === 'undefined') return;
 
@@ -573,6 +580,7 @@ export default function DundunPro() {
   const [authAccount, setAuthAccount] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authPasswordConfirm, setAuthPasswordConfirm] = useState('');
+  const [authReturnTo, setAuthReturnTo] = useState('');
   const [showAuthPassword, setShowAuthPassword] = useState(false);
   const [showAuthPasswordConfirm, setShowAuthPasswordConfirm] = useState(false);
   const [showPasswordCurrent, setShowPasswordCurrent] = useState(false);
@@ -634,7 +642,6 @@ export default function DundunPro() {
   const authUserPoints = authUser?.points;
   const userBalanceState = useUserBalance();
   const balance = userBalanceState.balance ?? 0;
-  const balanceHydrated = userBalanceState.ready;
 
   const getWorkflowDisableMeta = useCallback((workflowId: string) => {
     return disabledWorkflowMap[workflowId] || null;
@@ -871,6 +878,23 @@ export default function DundunPro() {
 
   useEffect(() => {
     let cancelled = false;
+    let initialReturnTo = '';
+
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const returnTo = getSafeReturnTo(params.get('returnTo'));
+      initialReturnTo = returnTo;
+      if (returnTo) setAuthReturnTo(returnTo);
+      if (params.get('login') === '1') {
+        setAuthMode('login');
+        setAuthError('');
+      }
+      if (params.get('expired') === '1') {
+        setSessionExpiredNotice('登录状态已失效，请重新登录。');
+      }
+    } catch {
+      // ignore URL parsing errors
+    }
 
     // 立即从缓存恢复登录状态
     try {
@@ -893,6 +917,10 @@ export default function DundunPro() {
           if (data?.success && data?.data) {
             setAuthUser(data.data);
             try { window.localStorage.setItem('auth_user_cache', JSON.stringify(data.data)); } catch { /* ignore */ }
+            setSessionExpiredNotice('');
+            if (initialReturnTo) {
+              window.location.replace(initialReturnTo);
+            }
           } else if (response.status === 401) {
             // 仅在明确未授权时退出登录
             setAuthUser(null);
@@ -1002,7 +1030,7 @@ export default function DundunPro() {
       document.removeEventListener('visibilitychange', onFocusRefresh);
       if (timer) clearInterval(timer);
     };
-  }, [authUserId]);
+  }, [authUserId, mergeServerQueueWithLocal]);
 
   useEffect(() => {
     setProfileUsername(authUser?.username ?? '');
@@ -1035,7 +1063,7 @@ export default function DundunPro() {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onFocus);
     };
-  }, [authUserId]);
+  }, [authUserId, mergeServerQueueWithLocal]);
 
   useEffect(() => {
     if (!authUserId) return;
@@ -1171,7 +1199,7 @@ export default function DundunPro() {
     return () => {
       cancelled = true;
     };
-  }, [authUserId]);
+  }, [authUserId, mergeServerQueueWithLocal]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -2224,14 +2252,10 @@ export default function DundunPro() {
 
     void (async () => {
       try {
-        const refundRes = await fetch('/api/points/refund', {
+        const refundRes = await fetch('/api/tasks/cancel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            points: Math.max(0, refundPoints),
-            reason: `排队取消返还：${target.payload.workflowTitle}`,
-            relatedId: target.payload.workflowId,
-          }),
+          body: JSON.stringify({ id: queueId }),
         });
         const refundData = await refundRes.json().catch(() => ({}));
         if (!refundRes.ok || !refundData?.success) {
@@ -2240,10 +2264,11 @@ export default function DundunPro() {
         }
 
         setTaskQueue((prev) => prev.filter((t) => t.id !== queueId));
-        setUserBalance(Number(refundData?.data?.points ?? balance + Math.max(0, refundPoints)));
+        const pointsDelta = Math.max(0, Number(refundData?.data?.pointsDelta ?? refundPoints));
+        setUserBalance(balance + pointsDelta);
         addPointLedgerItem({
           type: 'income',
-          points: Math.max(0, refundPoints),
+          points: pointsDelta,
           reason: `排队取消返还：${target.payload.workflowTitle}`,
           relatedId: target.payload.workflowId,
         });
@@ -2253,7 +2278,7 @@ export default function DundunPro() {
             error: '任务已取消（未执行，已返还该任务消耗的积分）',
           });
         }
-        toast.success(`已取消排队任务，返还 ${refundPoints} 积分`);
+        toast.success(`已取消排队任务，返还 ${pointsDelta} 积分`);
       } catch {
         toast.error('返还积分失败，请稍后再试');
       }
@@ -2543,6 +2568,9 @@ export default function DundunPro() {
   const filteredWorkflows = useMemo(() => {
     const kw = workflowKeyword.trim().toLowerCase();
     return workflows.filter((wf) => {
+      const disabledMeta = getWorkflowDisableMeta(wf.workflowId);
+      if (disabledMeta?.disabled) return false;
+
       const tagOk = selectedWorkflowTag === '全部' || wf.category === selectedWorkflowTag;
       const kwOk =
         !kw ||
@@ -2551,7 +2579,7 @@ export default function DundunPro() {
         wf.category.toLowerCase().includes(kw);
       return tagOk && kwOk;
     });
-  }, [selectedWorkflowTag, workflowKeyword]);
+  }, [getWorkflowDisableMeta, selectedWorkflowTag, workflowKeyword]);
 
   const redeemPointsByCode = () => {
     const code = redeemCodeInput.trim();
@@ -2960,7 +2988,7 @@ export default function DundunPro() {
     }, 220);
   };
 
-  const handleAdvisorDragMove = (clientX: number, clientY: number) => {
+  const handleAdvisorDragMove = useCallback((clientX: number, clientY: number) => {
     if (!advisorLongPressActiveRef.current || !isDraggingAdvisor) return;
 
     const floatingSize = 80;
@@ -2970,15 +2998,15 @@ export default function DundunPro() {
     const nextY = Math.min(Math.max(clientY - advisorDragStartRef.current.offsetY, 0), maxY);
 
     setAdvisorPosition({ x: nextX, y: nextY });
-  };
+  }, [isDraggingAdvisor]);
 
-  const stopAdvisorDragging = () => {
+  const stopAdvisorDragging = useCallback(() => {
     clearAdvisorPressTimer();
     if (isDraggingAdvisor) {
       setIsDraggingAdvisor(false);
     }
     advisorLongPressActiveRef.current = false;
-  };
+  }, [isDraggingAdvisor]);
 
   useEffect(() => {
     if (previewZoom <= 1) {
@@ -3018,7 +3046,7 @@ export default function DundunPro() {
       window.removeEventListener('touchcancel', handleDragEnd);
       clearAdvisorPressTimer();
     };
-  }, [isDraggingAdvisor, advisorPosition]);
+  }, [handleAdvisorDragMove, stopAdvisorDragging]);
 
   useEffect(() => {
     if (!previewMedia) return;
@@ -3239,6 +3267,9 @@ export default function DundunPro() {
       setAuthPasswordConfirm('');
       setIsUserMenuOpen(false);
       setRechargeTab('user');
+      if (authReturnTo) {
+        window.location.assign(authReturnTo);
+      }
       toast.success(authMode === 'register' ? '注册并登录成功' : '登录成功');
     } catch {
       setAuthError('网络异常，请稍后重试');
@@ -3491,8 +3522,11 @@ export default function DundunPro() {
               }}
             >
               <div>
-                <label className="block text-sm font-medium text-zinc-700 mb-1.5">账号</label>
+                <label htmlFor="auth-account" className="block text-sm font-medium text-zinc-700 mb-1.5">账号</label>
                 <input
+                  id="auth-account"
+                  name="username"
+                  type="text"
                   value={authAccount}
                   onChange={(e) => {
                     setAuthAccount(e.target.value.replace(/\D/g, '').slice(0, 12));
@@ -3507,10 +3541,23 @@ export default function DundunPro() {
                 {authMode === 'register' && <p className="text-xs text-zinc-400 mt-1">账号为8-12位纯数字，注册后不可修改</p>}
               </div>
 
+              <input
+                type="text"
+                name="username"
+                autoComplete="username"
+                value={authAccount}
+                readOnly
+                tabIndex={-1}
+                aria-hidden="true"
+                className="hidden"
+              />
+
               <div>
-                <label className="block text-sm font-medium text-zinc-700 mb-1.5">密码</label>
+                <label htmlFor="auth-password" className="block text-sm font-medium text-zinc-700 mb-1.5">密码</label>
                 <div className="relative">
                   <input
+                    id="auth-password"
+                    name="password"
                     type={showAuthPassword ? 'text' : 'password'}
                     value={authPassword}
                     onChange={(e) => {
@@ -3534,9 +3581,21 @@ export default function DundunPro() {
 
               {authMode === 'register' && (
                 <div>
-                  <label className="block text-sm font-medium text-zinc-700 mb-1.5">确认密码</label>
+                  <input
+                    type="text"
+                    name="username"
+                    autoComplete="username"
+                    value={authAccount}
+                    readOnly
+                    tabIndex={-1}
+                    aria-hidden="true"
+                    className="hidden"
+                  />
+                  <label htmlFor="auth-password-confirm" className="block text-sm font-medium text-zinc-700 mb-1.5">确认密码</label>
                   <div className="relative">
                     <input
+                      id="auth-password-confirm"
+                      name="password-confirm"
                       type={showAuthPasswordConfirm ? 'text' : 'password'}
                       value={authPasswordConfirm}
                       onChange={(e) => {
@@ -3706,7 +3765,7 @@ export default function DundunPro() {
       {/* 左侧边栏 */}
       <div className="w-72 h-screen shrink-0 bg-white border-r border-zinc-200 p-6 flex flex-col text-zinc-800">
         <div className="flex items-center gap-3 mb-10">
-          <img src="/kunkun-logo.png" alt="坤坤 AI Logo" className="w-9 h-9 rounded-2xl object-cover" />
+          <img src="/kunkun-logo.webp" alt="坤坤 AI Logo" className="w-9 h-9 rounded-2xl object-cover" />
           <div>
             <div className="font-bold text-2xl text-zinc-900">坤坤 AI</div>
             <div className="text-xs text-zinc-500">创作平台</div>

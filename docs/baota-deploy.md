@@ -54,9 +54,17 @@ PORT=3000
 # 你的正式网站地址
 INTERNAL_BASE_URL=https://kunkunai.top
 
-# 正式数据库连接地址，必须换成你的 PostgreSQL 数据库
+# 正式数据库连接地址。可以继续使用 Neon PostgreSQL，不必购买阿里云数据库。
 DATABASE_URL="postgresql://用户名:密码@数据库地址:5432/数据库名?schema=public"
 ```
+
+如果继续用 Neon，把 Neon 控制台里的 PostgreSQL 连接串填到 `DATABASE_URL` 即可。建议使用带 SSL 的连接串，例如：
+
+```env
+DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require"
+```
+
+服务器部署在阿里云 ECS，不要求数据库也在阿里云；只要 ECS 能访问 Neon，Prisma 就能正常连接。
 
 这些也要填真实值：
 
@@ -74,6 +82,17 @@ OSS_ACCESS_KEY_SECRET="你的阿里云 OSS AccessKey Secret"
 OSS_ENDPOINT="https://oss-cn-shanghai-internal.aliyuncs.com"
 OSS_TEMP_PREFIX="tmp-inputs/"
 TEMP_UPLOAD_MAX_MB=50
+
+# 微信 Native 支付
+WECHAT_MCH_ID="你的微信商户号"
+WECHAT_APP_ID="你的公众号/小程序 AppID"
+WECHAT_API_V3_KEY="你的 API v3 key"
+WECHAT_API_CERT_SERIAL_NO="商户 API 证书序列号"
+WECHAT_API_PRIVATE_KEY_PATH="/www/wwwroot/kunkunai.top/certs/wechat-api-private.pem"
+WECHAT_PAY_PUBLIC_KEY_ID="微信支付公钥ID，通常以 PUB_KEY_ID_ 开头"
+WECHAT_PAY_PUBLIC_KEY_PATH="/www/wwwroot/kunkunai.top/certs/wechatpay-public-key.pem"
+WECHAT_NOTIFY_URL="https://kunkunai.top/api/pay/wechat/notify"
+WECHAT_REFUND_NOTIFY_URL="https://kunkunai.top/api/pay/wechat/refund-notify"
 ```
 
 如果你的 ECS 和 OSS 都在阿里云上海地域，`OSS_ENDPOINT` 建议用内网地址：
@@ -329,3 +348,17 @@ curl -I https://kunkunai.top
 如果本机 `3000` 通，但域名不通，通常是宝塔反向代理或 Nginx 配置问题。
 
 如果本机 `3000` 不通，通常是 PM2 没启动成功、环境变量错了，或者构建失败。
+
+## 十、上线检查清单
+
+正式部署完成后建议再跑一遍：
+
+```bash
+pm2 status
+pm2 logs kunkunai
+curl -I http://127.0.0.1:3000
+curl -I https://kunkunai.top
+```
+
+如果 `http://127.0.0.1:3000` 通，但域名不通，重点查宝塔反向代理和 Nginx。
+如果域名通但微信回调失败，重点查 `WECHAT_NOTIFY_URL`、微信支付公钥 ID、公钥文件、API v3 密钥和商户私钥路径。

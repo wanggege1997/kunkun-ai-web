@@ -27,6 +27,8 @@ export async function GET(request: Request) {
       amountFen: true,
       points: true,
       status: true,
+      codeUrl: true,
+      timeExpireAt: true,
       createdAt: true,
     },
   });
@@ -36,7 +38,7 @@ export async function GET(request: Request) {
   }
 
   const data = list.map((row) => {
-    const expireAt = new Date(new Date(row.createdAt).getTime() + ORDER_EXPIRE_MS);
+    const expireAt = row.timeExpireAt || new Date(new Date(row.createdAt).getTime() + ORDER_EXPIRE_MS);
     const remainingSeconds = Math.max(0, Math.floor((expireAt.getTime() - now) / 1000));
     return {
       ...row,

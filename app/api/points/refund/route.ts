@@ -1,28 +1,37 @@
 import { NextResponse } from 'next/server';
 import { changeUserPoints } from '@/lib/points';
-import { getSessionUserFromRequest } from '@/lib/server-auth';
+
+function getInternalSecret() {
+  return process.env.INTERNAL_WORKER_SECRET || process.env.JWT_SECRET || 'dev-worker-secret';
+}
 
 export async function POST(request: Request) {
   try {
-    const user = await getSessionUserFromRequest(request);
-    if (!user) {
-      return NextResponse.json({ success: false, message: '未登录' }, { status: 401 });
+    const internalHeader = request.headers.get('x-internal-worker-secret') || '';
+    if (!internalHeader || internalHeader !== getInternalSecret()) {
+      return NextResponse.json({ success: false, message: '内部鉴权失败' }, { status: 401 });
     }
 
     const body = await request.json().catch(() => ({}));
+    const userId = String(body.userId ?? '').trim();
     const points = Number(body.points ?? 0);
     const reason = String(body.reason ?? '').trim() || '任务退款';
     const relatedId = String(body.relatedId ?? '').trim() || undefined;
+    const operatorId = String(body.operatorId ?? '').trim() || undefined;
 
     if (!Number.isInteger(points) || points <= 0) {
       return NextResponse.json({ success: false, message: 'points 必须是正整数' }, { status: 400 });
     }
+    if (!userId) {
+      return NextResponse.json({ success: false, message: '缺少用户ID' }, { status: 400 });
+    }
 
     const result = await changeUserPoints({
-      userId: user.id,
+      userId,
       delta: points,
       reason,
       relatedId,
+      operatorId,
     });
 
     return NextResponse.json({

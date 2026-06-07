@@ -1,6 +1,7 @@
-import { NextResponse } from 'next/server';
+﻿import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSessionUserFromRequest } from '@/lib/server-auth';
+import { closePaymentOrder } from '@/lib/payment-service';
 
 export async function POST(
   request: Request,
@@ -20,40 +21,24 @@ export async function POST(
       orderNo,
       userId: user.id,
     },
+    select: { orderNo: true },
   });
   if (!order) {
     return NextResponse.json({ success: false, message: '订单不存在' }, { status: 404 });
   }
 
-  if (order.status === 'closed') {
-    return NextResponse.json({ success: true, message: '已关闭（幂等）', data: { orderNo, status: 'closed' } });
+  try {
+    const result = await closePaymentOrder(order.orderNo);
+    return NextResponse.json({
+      success: true,
+      data: {
+        orderNo,
+        status: result.order?.status || 'closed',
+        reason,
+      },
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : '关闭订单失败';
+    return NextResponse.json({ success: false, message }, { status: 409 });
   }
-
-  if (['paid', 'credited', 'refund_pending', 'refunded'].includes(order.status)) {
-    return NextResponse.json({ success: false, message: `订单状态不允许关闭: ${order.status}` }, { status: 409 });
-  }
-
-  const updated = await prisma.paymentOrder.updateMany({
-    where: {
-      id: order.id,
-      status: 'pending',
-    },
-    data: {
-      status: 'closed',
-      clientOrderNo: order.clientOrderNo || `closed:${reason}`,
-    },
-  });
-
-  if (updated.count === 0) {
-    return NextResponse.json({ success: true, message: '已处理（幂等）', data: { orderNo, status: 'closed' } });
-  }
-
-  return NextResponse.json({
-    success: true,
-    data: {
-      orderNo,
-      status: 'closed',
-      reason,
-    },
-  });
 }

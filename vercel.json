@@ -10,6 +10,15 @@
     "JWT_SECRET": "@jwt_secret",
     "RUNNINGHUB_API_KEY": "@runninghub_api_key",
     "INTERNAL_WORKER_SECRET": "@internal_worker_secret",
-    "INTERNAL_BASE_URL": "@internal_base_url"
+    "INTERNAL_BASE_URL": "@internal_base_url",
+    "WECHAT_MCH_ID": "@wechat_mch_id",
+    "WECHAT_APP_ID": "@wechat_app_id",
+    "WECHAT_API_V3_KEY": "@wechat_api_v3_key",
+    "WECHAT_API_CERT_SERIAL_NO": "@wechat_api_cert_serial_no",
+    "WECHAT_API_PRIVATE_KEY_PEM": "@wechat_api_private_key_pem",
+    "WECHAT_PLATFORM_CERT_SERIAL_NO": "@wechat_platform_cert_serial_no",
+    "WECHAT_PLATFORM_CERT_PEM": "@wechat_platform_cert_pem",
+    "WECHAT_NOTIFY_URL": "@wechat_notify_url",
+    "WECHAT_REFUND_NOTIFY_URL": "@wechat_refund_notify_url"
   }
 }

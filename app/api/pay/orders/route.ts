@@ -1,7 +1,8 @@
-import { NextResponse } from 'next/server';
+﻿import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSessionUserFromRequest } from '@/lib/server-auth';
 import { createOrderNo } from '@/lib/payment';
+import { createWechatNativePaymentOrder } from '@/lib/payment-service';
 
 const ORDER_REUSE_WINDOW_MS = 5 * 60 * 1000;
 const ORDER_CREATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -87,11 +88,13 @@ export async function POST(request: Request) {
       amountFen: true,
       points: true,
       status: true,
+      codeUrl: true,
+      timeExpireAt: true,
       createdAt: true,
     },
   });
 
-  if (reusableOrder) {
+  if (reusableOrder && (channel !== 'wechat' || (reusableOrder.codeUrl && reusableOrder.timeExpireAt && reusableOrder.timeExpireAt.getTime() > Date.now()))) {
     await pruneOverflowPendingOrders(user.id, 5);
     return NextResponse.json({
       success: true,
@@ -104,6 +107,7 @@ export async function POST(request: Request) {
   }
 
   const orderNo = createOrderNo('PO');
+  const timeExpireAt = new Date(Date.now() + 15 * 60 * 1000);
   const order = await prisma.paymentOrder.create({
     data: {
       orderNo,
@@ -112,6 +116,7 @@ export async function POST(request: Request) {
       amountFen,
       points,
       clientOrderNo,
+      timeExpireAt,
       status: 'pending',
     },
     select: {
@@ -120,9 +125,33 @@ export async function POST(request: Request) {
       amountFen: true,
       points: true,
       status: true,
+      codeUrl: true,
+      timeExpireAt: true,
       createdAt: true,
     },
   });
+
+  let codeUrl: string | null = null;
+  if (channel === 'wechat') {
+    try {
+      codeUrl = await createWechatNativePaymentOrder({
+        orderNo,
+        amountFen,
+        description: `坤坤 AI 积分充值 ${points}积分`,
+        timeExpireAt,
+      });
+    } catch (error: unknown) {
+      await prisma.paymentOrder.updateMany({
+        where: { orderNo, status: 'pending' },
+        data: {
+          status: 'failed',
+          clientOrderNo: clientOrderNo || 'wechat_native_create_failed',
+        },
+      });
+      const message = error instanceof Error ? error.message : '微信支付下单失败';
+      return NextResponse.json({ success: false, message }, { status: 502 });
+    }
+  }
 
   await pruneOverflowPendingOrders(user.id, 5);
 
@@ -130,6 +159,8 @@ export async function POST(request: Request) {
     success: true,
     data: {
       ...order,
+      codeUrl: codeUrl || order.codeUrl,
+      timeExpireAt,
       reused: false,
       payUrl: `/pay/${order.orderNo}`,
     },

@@ -1,12 +1,13 @@
-'use client';
+﻿'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
+import QRCode from 'qrcode';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { Toaster, toast } from 'sonner';
 import { refreshUserBalance } from '@/lib/user-balance-store';
 
-type OrderStatus = 'pending' | 'paid' | 'credited' | 'closed' | 'failed' | string;
+type OrderStatus = 'pending' | 'paid' | 'credited' | 'closed' | 'failed' | 'refund_pending' | 'refunded' | string;
 type PayChannel = 'wechat' | 'alipay';
 
 type PayOrder = {
@@ -15,8 +16,15 @@ type PayOrder = {
   amountFen: number;
   points: number;
   status: OrderStatus;
+  codeUrl: string | null;
+  timeExpireAt: string | null;
+  thirdTradeNo: string | null;
+  paidAt: string | null;
+  refundStatus: string | null;
+  refundedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  gatewayStatus?: string;
 };
 
 function toChineseOrderStatus(status: OrderStatus) {
@@ -25,7 +33,20 @@ function toChineseOrderStatus(status: OrderStatus) {
   if (normalized === 'paid' || normalized === 'credited') return '已支付';
   if (normalized === 'closed') return '已关闭';
   if (normalized === 'failed') return '支付失败';
+  if (normalized === 'refund_pending') return '退款中';
+  if (normalized === 'refunded') return '已退款';
   return status;
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatRemaining(seconds: number) {
+  const safe = Math.max(0, seconds);
+  const mm = pad2(Math.floor(safe / 60));
+  const ss = pad2(safe % 60);
+  return `${mm}:${ss}`;
 }
 
 const ORDER_EXPIRE_MS = 15 * 60 * 1000;
@@ -36,37 +57,39 @@ export default function PayOrderPage() {
   const orderNo = String(params?.orderNo || '');
 
   const [order, setOrder] = useState<PayOrder | null>(null);
-  const [activeChannel, setActiveChannel] = useState<PayChannel>('wechat');
-  const [wechatQrDataUrl, setWechatQrDataUrl] = useState('');
-  const [alipayQrDataUrl, setAlipayQrDataUrl] = useState('');
   const [loading, setLoading] = useState(true);
+  const [qrDataUrl, setQrDataUrl] = useState('');
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
   const [closingExpired, setClosingExpired] = useState(false);
+  const [pollingBlocked, setPollingBlocked] = useState(false);
+  const [orderAccessDenied, setOrderAccessDenied] = useState(false);
 
   const amountYuan = useMemo(() => ((order?.amountFen || 0) / 100).toFixed(2), [order?.amountFen]);
+  const loginHref = useMemo(
+    () => `/?login=1&expired=1&returnTo=${encodeURIComponent(`/pay/${orderNo}`)}`,
+    [orderNo]
+  );
   const paidOrCredited = order?.status === 'paid' || order?.status === 'credited';
   const isPending = order?.status === 'pending';
 
-  const remainingText = useMemo(() => {
-    const seconds = Math.max(0, remainingSeconds ?? 0);
-    const mm = String(Math.floor(seconds / 60)).padStart(2, '0');
-    const ss = String(seconds % 60).padStart(2, '0');
-    return `${mm}:${ss}`;
-  }, [remainingSeconds]);
-
-  const fetchOrder = async () => {
+  const fetchOrder = useCallback(async () => {
     if (!orderNo) return;
+    setPollingBlocked(false);
+    setOrderAccessDenied(false);
     const response = await fetch(`/api/pay/orders/${orderNo}`, { cache: 'no-store' });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.success || !data?.data) {
+      if (response.status === 401 || response.status === 403) {
+        setPollingBlocked(true);
+        setOrderAccessDenied(true);
+        setOrder(null);
+      }
       throw new Error(data?.message || '订单获取失败');
     }
-    const next = data.data as PayOrder;
-    setOrder(next);
-    setActiveChannel(next.channel || 'wechat');
-  };
+    setOrder(data.data as PayOrder);
+  }, [orderNo]);
 
-  const queryOrderStatus = async () => {
+  const queryOrderStatus = useCallback(async () => {
     if (!orderNo) return;
     const response = await fetch(`/api/pay/orders/${orderNo}/query`, {
       method: 'POST',
@@ -74,14 +97,18 @@ export default function PayOrderPage() {
       body: JSON.stringify({}),
     });
     const data = await response.json().catch(() => ({}));
+    if (response.status === 401 || response.status === 403) {
+      setPollingBlocked(true);
+      setOrderAccessDenied(true);
+      setOrder(null);
+      return;
+    }
     if (!response.ok || !data?.success || !data?.data) return;
-    setOrder((prev) => (prev ? { ...prev, status: String(data.data.status || prev.status) } : prev));
-  };
+    setOrder((prev) => (prev ? { ...prev, ...(data.data as PayOrder) } : prev));
+  }, [orderNo]);
 
   useEffect(() => {
     let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-
     void (async () => {
       try {
         await fetchOrder();
@@ -92,16 +119,23 @@ export default function PayOrderPage() {
       }
     })();
 
-    timer = setInterval(() => {
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchOrder]);
+
+  useEffect(() => {
+    if (!orderNo || !order || !isPending || pollingBlocked) return;
+
+    const timer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       void queryOrderStatus();
     }, 3000);
 
     return () => {
-      cancelled = true;
-      if (timer) clearInterval(timer);
+      window.clearInterval(timer);
     };
-  }, [orderNo]);
+  }, [isPending, order, orderNo, pollingBlocked, queryOrderStatus]);
 
   useEffect(() => {
     if (!paidOrCredited) return;
@@ -109,25 +143,50 @@ export default function PayOrderPage() {
   }, [paidOrCredited]);
 
   useEffect(() => {
-    if (!order?.createdAt) return;
+    if (!order) return;
     if (!isPending) return;
 
-    const computeRemain = () => {
-      const createdAtMs = new Date(order.createdAt).getTime();
-      if (Number.isNaN(createdAtMs)) return 0;
-      const expireAt = createdAtMs + ORDER_EXPIRE_MS;
-      return Math.floor((expireAt - Date.now()) / 1000);
-    };
+    const expireMs = order.timeExpireAt ? new Date(order.timeExpireAt).getTime() : new Date(order.createdAt).getTime() + ORDER_EXPIRE_MS;
+    if (Number.isNaN(expireMs)) return;
 
+    const computeRemain = () => Math.floor((expireMs - Date.now()) / 1000);
     setRemainingSeconds(Math.max(0, computeRemain()));
 
-    const timer = setInterval(() => {
-      const next = computeRemain();
-      setRemainingSeconds(Math.max(0, next));
+    const timer = window.setInterval(() => {
+      setRemainingSeconds(Math.max(0, computeRemain()));
     }, 1000);
 
-    return () => clearInterval(timer);
-  }, [order?.createdAt, isPending]);
+    return () => window.clearInterval(timer);
+  }, [order, isPending]);
+
+  useEffect(() => {
+    if (!order?.channel || order.channel !== 'wechat') {
+      setQrDataUrl('');
+      return;
+    }
+    if (!order.codeUrl) {
+      setQrDataUrl('');
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const dataUrl = await QRCode.toDataURL(order.codeUrl as string, {
+          errorCorrectionLevel: 'M',
+          margin: 1,
+          width: 320,
+        });
+        if (!cancelled) setQrDataUrl(dataUrl);
+      } catch {
+        if (!cancelled) setQrDataUrl('');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [order?.codeUrl, order?.channel]);
 
   useEffect(() => {
     if (!isPending) return;
@@ -150,20 +209,7 @@ export default function PayOrderPage() {
         setClosingExpired(false);
       }
     })();
-  }, [isPending, remainingSeconds, closingExpired, orderNo]);
-
-  const handleQrUpload = (channel: PayChannel, event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = String(reader.result || '');
-      if (channel === 'wechat') setWechatQrDataUrl(dataUrl);
-      else setAlipayQrDataUrl(dataUrl);
-    };
-    reader.readAsDataURL(file);
-    event.target.value = '';
-  };
+  }, [isPending, remainingSeconds, closingExpired, orderNo, queryOrderStatus]);
 
   const handleMockPaid = async () => {
     try {
@@ -185,6 +231,8 @@ export default function PayOrderPage() {
     }
   };
 
+  const remainingText = remainingSeconds === null ? '--:--' : formatRemaining(remainingSeconds);
+
   return (
     <div className="min-h-screen bg-[#f4f6fb] p-4 sm:p-8">
       <Toaster position="top-center" richColors />
@@ -199,6 +247,19 @@ export default function PayOrderPage() {
 
           {loading ? (
             <div className="text-zinc-500 text-sm">订单加载中...</div>
+          ) : orderAccessDenied ? (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              <div className="font-medium">请重新登录后查看订单</div>
+              <div className="mt-1 text-amber-700">当前登录状态已失效，登录后会回到此订单页面。</div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Link href={loginHref} className="h-10 px-4 rounded-xl btn-brand-gradient inline-flex items-center justify-center">
+                  返回登录
+                </Link>
+                <Link href="/" className="h-10 px-4 rounded-xl border border-amber-200 bg-white text-amber-800 inline-flex items-center justify-center hover:bg-amber-100">
+                  回到首页
+                </Link>
+              </div>
+            </div>
           ) : !order ? (
             <div className="text-rose-600 text-sm">订单不存在或无权限访问</div>
           ) : (
@@ -207,26 +268,37 @@ export default function PayOrderPage() {
                 <div>充值金额：￥{amountYuan}</div>
                 <div>到账积分：{order.points}</div>
                 <div>订单状态：{toChineseOrderStatus(order.status)}</div>
+                {order.gatewayStatus ? <div>渠道状态：{order.gatewayStatus}</div> : null}
                 {isPending ? <div>剩余支付时间：{remainingText}</div> : null}
+                {order.refundStatus ? <div>退款状态：{order.refundStatus}</div> : null}
               </div>
 
-              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-center">
-                <div className="text-sm text-zinc-600 mb-2">请使用{activeChannel === 'wechat' ? '微信' : '支付宝'}扫码支付</div>
-                <img
-                  src={activeChannel === 'wechat' ? (wechatQrDataUrl || 'https://dummyimage.com/240x240/f3f4f6/999.png&text=WeChat+QR') : (alipayQrDataUrl || 'https://dummyimage.com/240x240/f3f4f6/999.png&text=Alipay+QR')}
-                  alt={activeChannel === 'wechat' ? '微信收款码' : '支付宝收款码'}
-                  className="w-56 h-56 mx-auto rounded-xl border border-zinc-200 bg-white object-cover"
-                />
-                <label className="inline-block mt-3 text-sm text-[#266eff] cursor-pointer hover:brightness-95">
-                  上传{activeChannel === 'wechat' ? '微信' : '支付宝'}收款二维码（预留）
-                  <input
-                    type="file"
-                    accept="image/png,image/jpeg,image/webp"
-                    className="hidden"
-                    onChange={(e) => handleQrUpload(activeChannel, e)}
-                  />
-                </label>
-              </div>
+              {order.channel === 'wechat' ? (
+                <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-center">
+                  <div className="text-sm text-zinc-600 mb-2">请使用微信扫一扫完成支付</div>
+                  {qrDataUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element -- 支付二维码为运行时 data URL，保持浏览器原生渲染 */
+                    <img
+                      src={qrDataUrl}
+                      alt="微信支付二维码"
+                      className="w-56 h-56 mx-auto rounded-xl border border-zinc-200 bg-white object-contain"
+                    />
+                  ) : (
+                    <div className="w-56 h-56 mx-auto rounded-xl border border-zinc-200 bg-white flex items-center justify-center text-sm text-zinc-400">
+                      二维码生成中...
+                    </div>
+                  )}
+                  <div className="mt-3 text-xs text-zinc-500 break-all">
+                    {order.codeUrl || '支付链接生成中'}
+                  </div>
+                  <div className="mt-2 text-xs text-zinc-500">特殊商品不支持自助退款</div>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-center space-y-3">
+                  <div className="text-sm text-zinc-600">当前订单不是微信 Native 支付订单</div>
+                  <div className="text-xs text-zinc-500">如需继续保留支付宝收款，请沿用原有流程。</div>
+                </div>
+              )}
 
               <div className="mt-5 flex flex-wrap gap-2">
                 <button
