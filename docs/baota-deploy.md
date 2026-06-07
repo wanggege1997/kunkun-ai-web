@@ -229,6 +229,46 @@ curl -I http://127.0.0.1:3000
 
 保存后，宝塔/Nginx 会把访问 `https://kunkunai.top` 的请求转给 Next.js。
 
+### 反向代理缓存设置
+
+Next.js 站点不要缓存首页 HTML 和 `/api/*`。如果 Nginx 返回了旧 HTML，页面会继续引用旧的 `/_next/static/` 文件，用户就可能看到白屏、404、502 或一直卡在旧的加载状态。
+
+在宝塔反向代理配置文件里找到类似：
+
+```nginx
+location ^~ /
+{
+    proxy_pass http://127.0.0.1:3000;
+    ...
+}
+```
+
+在 `location ^~ /` 内加入：
+
+```nginx
+proxy_cache off;
+proxy_no_cache 1;
+proxy_cache_bypass 1;
+add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate" always;
+```
+
+保存后执行：
+
+```bash
+nginx -t
+/etc/init.d/nginx reload
+rm -rf /www/server/nginx/proxy_cache_dir/*
+```
+
+部署后可用下面两条命令确认 Nginx 返回的 HTML 和本机 Next.js 一致：
+
+```bash
+curl -s https://kunkunai.top | grep -o '/_next/static/[^"]*\.css' | head -1
+curl -s http://127.0.0.1:3000 | grep -o '/_next/static/[^"]*\.css' | head -1
+```
+
+两条输出应当一致。
+
 ## 六、处理宝塔默认页
 
 如果访问域名还显示：
@@ -294,7 +334,8 @@ npm ci
 npx prisma generate
 npx prisma db push
 npm run build
-pm2 restart kunkunai
+pm2 restart kunkunai --update-env
+/etc/init.d/nginx reload
 ```
 
 每条命令的意思：
@@ -315,8 +356,11 @@ npx prisma db push
 npm run build
 重新构建网站
 
-pm2 restart kunkunai
+pm2 restart kunkunai --update-env
 重启网站服务，让新代码生效
+
+/etc/init.d/nginx reload
+让宝塔 Nginx 重新加载反向代理配置
 ```
 
 ## 九、常用排查命令
